@@ -108,7 +108,12 @@ def list_projects() -> list[dict]:
 
 def list_completions(since_iso: str, cfg: dict) -> list[dict]:
     token = _token()
+    project_id = str((cfg.get("backend_options") or {}).get("project_id") or "")
 
+    # Completions stream A: the by_completion_date log. This reliably carries
+    # one-off (non-recurring) completions, but RECURRING tasks that reset for
+    # their next occurrence often drop out of this endpoint's window — so on
+    # its own it silently starves the ledger of everyday habit rewards.
     # The watermark is advisory and clamped: a late sync from an offline
     # device carries an OLD completed_at, so a tight window drops it forever.
     try:
@@ -126,21 +131,61 @@ def list_completions(since_iso: str, cfg: dict) -> list[dict]:
     )
     payload = _get(url, token)
 
-    project_id = str((cfg.get("backend_options") or {}).get("project_id") or "")
-    out = []
+    now = datetime.now(timezone.utc)
+    hold = []  # seed with the completion's own timestamp when we have one
     for item in payload.get("items", []):
         if project_id and str(item.get("project_id")) != project_id:
             continue  # ownership: only this scope's project belongs to this ledger
-        out.append({
+        hold.append({
             "id": str(item.get("id")),
             "title": (item.get("content") or "task")[:80],
             "completed_at": item.get("completed_at") or "",
             # Todoist's API integer is INVERTED vs the app's P1-P4 labels:
             # 4 = urgent (app P1). Passed through as the raw integer.
             "priority": str(item.get("priority") or 1),
-            # A project-scoped ledger maps to one category, so the per-category
-            # achievement ladders follow the ledger's own scope. Overridable.
             "category": str(cfg["backend_options"].get("category") or ""),
             "source": SOURCE,
         })
+
+    # Completions stream B: the live tasks' completed_count. The engine dedupes
+    # at day granularity (source:id:YYYY-MM-DD), so emitting ONE record per day
+    # per task is enough — the count of days an occurrence was completed today
+    # is what matters, and recurring tasks reset immediately after a check,
+    # so completed_count>0 today maps to one today-winning occurrence.
+    if project_id:
+        tasks_url = f"{API}/tasks?project_id={project_id}&limit=200"
+        tasks = (_get(tasks_url, token) or {}).get("results", [])
+        for t in tasks:
+            completed_count = t.get("completed_count") or 0
+            if completed_count <= 0:
+                continue
+            stamp = t.get("completed_at") or now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            # Give today's occurrence a concrete date; the engine's day-keying
+            # collapses multiple occurrences of the same task+day into one award.
+            try:
+                dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                dt = now
+            # Only pay for occurrences that land inside the lookback window.
+            if dt < floor:
+                continue
+            hold.append({
+                "id": str(t.get("id")),
+                "title": (t.get("content") or "task")[:80],
+                "completed_at": dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "priority": str(t.get("priority") or 1),
+                "category": str(cfg["backend_options"].get("category") or ""),
+                "source": SOURCE,
+            })
+
+    # De-duplicate by source:id:day so a task caught in both streams and by
+    # multiple occurrences on one day pays exactly once per day.
+    out, seen_keys = [], set()
+    for rec in hold:
+        stamp = str(rec["completed_at"])[:10]
+        key = f"{SOURCE}:{rec['id']}:{stamp}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        out.append(rec)
     return out
