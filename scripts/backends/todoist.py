@@ -21,27 +21,71 @@ API = "https://api.todoist.com/api/v1"
 MAX_LOOKBACK_DAYS = 7
 
 
-def _token() -> str:
-    """Token from the environment, else from Hermes' .env file.
+def env_candidates() -> list[Path]:
+    """Every .env worth searching, most-specific first.
 
-    A cron run gets no shell profile, so the environment alone is not enough —
-    without this fallback every scheduled poll dies with "not set" while the
-    interactive one works, which is a confusing failure to debug.
+    A skill can be installed into any profile, and each profile has its own
+    .env. Hardcoding one path is what makes a skill work for its author and
+    fail for everyone else.
     """
+    out: list[Path] = []
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        out.append(Path(home) / ".env")
+    out.append(Path.home() / ".hermes" / ".env")
+    profiles = Path.home() / ".hermes" / "profiles"
+    if profiles.is_dir():
+        out.extend(sorted(profiles.glob("*/.env")))
+    seen, uniq = set(), []
+    for p in out:
+        if str(p) not in seen:
+            seen.add(str(p))
+            uniq.append(p)
+    return uniq
+
+
+def _read_env_value(path: Path, key: str) -> str | None:
+    if not path.is_file():
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        line = line.strip()
+        if line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        if k.strip() == key:
+            v = v.strip().strip('"').strip("'")
+            if v:
+                return v
+    return None
+
+
+def find_token() -> tuple[str | None, Path | None]:
+    """Return (token, source_file). source_file is None when it came from the
+    environment, so callers can report *where* it was found without ever
+    printing the value itself."""
     tok = os.environ.get("TODOIST_API_TOKEN")
     if tok:
+        return tok, None
+    for path in env_candidates():
+        value = _read_env_value(path, "TODOIST_API_TOKEN")
+        if value:
+            return value, path
+    return None, None
+
+
+def _token() -> str:
+    """The API token, or a RuntimeError that says exactly where we looked."""
+    tok, _src = find_token()
+    if tok:
         return tok
-    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
-    env_file = Path(home) / ".env"
-    if env_file.is_file():
-        for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if line.startswith("TODOIST_API_TOKEN="):
-                value = line.split("=", 1)[1].strip().strip('"').strip("'")
-                if value:
-                    return value
+    looked = "\n".join(f"  - {p}" for p in env_candidates())
     raise RuntimeError(
-        f"TODOIST_API_TOKEN is not set and not found in {env_file}"
+        "TODOIST_API_TOKEN not found. Set it in the environment, or add it to "
+        "one of these .env files:\n" + looked
     )
 
 
@@ -51,6 +95,15 @@ def _get(url: str, token: str) -> dict:
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.load(resp)
+
+
+def list_projects() -> list[dict]:
+    """Live project list, for the setup wizard."""
+    payload = _get(f"{API}/projects", _token())
+    items = payload
+    if isinstance(payload, dict):
+        items = payload.get("results") or payload.get("items") or []
+    return sorted(items, key=lambda p: str(p.get("name", "")).lower())
 
 
 def list_completions(since_iso: str, cfg: dict) -> list[dict]:

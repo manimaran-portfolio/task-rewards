@@ -528,20 +528,84 @@ def cmd_streak_check(cfg: dict, state: dict, ledger_path: Path) -> str:
     return f"⚠️ No completions today — your {state['streak_days']}-day streak ends at midnight."
 
 
+def _discover_configs() -> list[Path]:
+    """Existing task-rewards configs, for a helpful message when none is given."""
+    root = Path.home() / ".hermes"
+    found: list[Path] = []
+    for pat in ("task-rewards*.json", "profiles/*/task-rewards*.json"):
+        found.extend(sorted(root.glob(pat)))
+    return [p for p in found if not p.name.endswith("-ledger.json")]
+
+
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="task-rewards engine")
-    ap.add_argument("--config", required=True, help="path to config JSON")
+    ap = argparse.ArgumentParser(
+        prog="rewards.py",
+        description="task-rewards \u2014 XP, levels and streaks for completed tasks",
+        epilog="First time? Run --setup. Something broken? Run --doctor.",
+    )
+    ap.add_argument("--config", default=str(Path.home() / ".hermes" / "task-rewards.json"),
+                    help="path to config JSON (default: ~/.hermes/task-rewards.json)")
     ap.add_argument("--poll", action="store_true", help="fetch completions and award")
     ap.add_argument("--status", action="store_true", help="print player status")
     ap.add_argument("--compact", action="store_true", help="short status")
     ap.add_argument("--streak-check", action="store_true", help="evening streak warning")
-    ap.add_argument("--ledger", action="store_true", help="dump raw ledger")
-    args = ap.parse_args(argv)
+    ap.add_argument("--ledger", action="store_true", help="dump raw ledger as JSON")
 
+    setup_grp = ap.add_argument_group("setup")
+    setup_grp.add_argument("--setup", action="store_true",
+                           help="run the interactive setup wizard")
+    setup_grp.add_argument("--doctor", action="store_true",
+                           help="report the environment and exit (read-only)")
+    setup_grp.add_argument("--list-projects", action="store_true",
+                           help="list Todoist projects and exit")
+    setup_grp.add_argument("--force", action="store_true",
+                           help="with --setup, overwrite an existing config")
+    setup_grp.add_argument("--yes", "-y", action="store_true",
+                           help="with --setup, accept detected defaults")
+    setup_grp.add_argument("--backend", choices=["todoist", "markdown", "json"],
+                           help="with --setup, skip source detection")
+    setup_grp.add_argument("--project-id", help="with --setup, the Todoist project")
+    setup_grp.add_argument("--path", help="with --setup, the markdown file or folder")
+    setup_grp.add_argument("--scope", help="with --setup, ledger name")
+    setup_grp.add_argument("--category", help="with --setup, category for ladders")
+    setup_grp.add_argument("--timezone", help="with --setup, IANA timezone")
+    setup_grp.add_argument("--ledger-path", dest="ledger_file",
+                           help="with --setup, where to write the ledger")
+    setup_grp.add_argument("--notify", choices=["digest", "instant", "off"],
+                           help="with --setup, notification style")
+
+    args = ap.parse_args(argv)
     cfg_path = Path(os.path.expanduser(args.config))
+
+    # Commands that do not need an existing config.
+    if args.setup or args.doctor or args.list_projects:
+        import wizard
+        if args.list_projects:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from backends import todoist
+            try:
+                for p in todoist.list_projects():
+                    print(f"{p.get('id')}  {p.get('name')}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"task-rewards: {type(exc).__name__}: {exc}", file=sys.stderr)
+                return 2
+            return 0
+        if args.doctor:
+            return wizard.cmd_doctor(cfg_path)
+        return wizard.cmd_setup(args)
+
     cfg = load_json(cfg_path, {})
     if not cfg:
-        print(f"task-rewards: no config at {cfg_path}", file=sys.stderr)
+        print(f"task-rewards: no config at {str(cfg_path).replace(str(Path.home()), '~', 1)}",
+              file=sys.stderr)
+        others = _discover_configs()
+        if others:
+            print("  found existing config(s):", file=sys.stderr)
+            for p in others:
+                print(f"    --config {str(p).replace(str(Path.home()), '~', 1)}",
+                      file=sys.stderr)
+        me = str(Path(__file__)).replace(str(Path.home()), "~", 1)
+        print(f"  or run:  python3 {me} --setup", file=sys.stderr)
         return 2
 
     ledger_path = Path(os.path.expanduser(cfg["ledger"]))

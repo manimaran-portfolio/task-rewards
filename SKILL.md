@@ -44,11 +44,37 @@ Todoist or against any markdown checklist. Nothing leaves the machine.
 All commands go through `terminal`. `${SKILL_DIR}` is this skill's directory.
 
 ```
+terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --setup")
 terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --config ~/.hermes/task-rewards.json --poll")
 terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --config ~/.hermes/task-rewards.json --status")
 ```
 
 `--poll` is silent when nothing changed by design, so it is safe on a schedule.
+If anything looks wrong, run `--doctor` before debugging by hand.
+
+## Setup and Diagnosis
+
+**`--setup` is the entry point, not the config file.** It detects the
+environment, lists real task sources, writes a config, and runs a baseline
+dry-run that awards nothing. It works interactively on a TTY and
+non-interactively via flags, so you can drive it without prompting:
+
+```
+terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --setup --yes")
+terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --setup --list-projects")
+terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --setup --yes --project-id <id> --scope health")
+```
+
+Flags: `--backend`, `--project-id`, `--path`, `--scope`, `--category`,
+`--timezone`, `--ledger-path`, `--notify`, `--force` (overwrite), `--yes`
+(accept detected defaults).
+
+**`--doctor` reports the environment and writes nothing.** Run it first when
+something fails — it answers the questions that actually go wrong:
+it finds the token and names the file it came from, checks the config and
+ledger are reachable, verifies a live API call, and **detects when the skill is
+installed outside the active profile's skills directory** (the agent then
+cannot discover it, even though every file is present). Never prints the token.
 
 ## Division of Labour — what the agent does vs what the engine does
 
@@ -80,6 +106,9 @@ The rule: **the script owns the numbers; you own the meaning.**
 
 | Command | Purpose |
 |---|---|
+| `--setup` | **First run.** Detect, write config, baseline dry-run |
+| `--doctor` | Report the environment; read-only, writes nothing |
+| `--list-projects` | List Todoist projects with their ids |
 | `--poll` | Fetch completions, award XP, print a reward block (empty if none) |
 | `--status` | Level, streak, totals, achievement list |
 | `--status --compact` | Two lines only |
@@ -88,31 +117,31 @@ The rule: **the script owns the numbers; you own the meaning.**
 
 ## Procedure
 
-Run the setup conversationally — do not hand the user a config file to edit.
+**First run: use `--setup`. Do not hand-build a config.** The wizard does the
+detection, validation, writing and baseline in one pass.
 
-1. **Find the task source.** Use `search_files(target='files')` for `*.md` in the
-   user's notes, or ask whether they use Todoist. Completion criterion: you can
-   name one concrete source, and for markdown you have read a sample of it with
-   `read_file` to confirm it contains checked tasks.
-2. **Validate before writing anything.** For markdown, confirm the path resolves.
-   For todoist, confirm `TODOIST_API_TOKEN` is present and a completed-tasks call
-   returns HTTP 200. Completion criterion: a real call succeeded, not a guess.
-3. **Ask for the scope name and timezone.** Scope is a short label for this
-   ledger ("health", "work"). Timezone must be an IANA name. Completion
-   criterion: both captured; never infer the timezone from the host clock.
-4. **Write the config** to `~/.hermes/task-rewards.json` with `write_file`.
-   Completion criterion: file exists and parses.
-5. **Dry run** `--poll` once. This prints a baseline notice and awards nothing —
-   existing completions are recorded so history never floods the ledger.
-   Completion criterion: the baseline notice appeared.
-6. **Confirm, then schedule.** Only after the dry run looks right, ask the user
-   whether to create the cron job, then create it with `cronjob` (every 15
-   minutes for near-immediate rewards, hourly for gentler). Set the job to
-   deliver the script's stdout. Completion criterion: the job appears in
-   `cronjob(action='list')`.
-7. **Optionally add an evening `--streak-check` job.** This is the highest-value
-   notification in the whole skill — it warns before a streak is lost rather
-   than celebrating after the fact.
+1. **Check the environment** with `--doctor`. Fix anything it marks ✗ before
+   going further — especially a skill installed outside the active profile's
+   skills dir. Every file can be present and correct while the agent still
+   cannot see the skill at all. Completion criterion: token found, live API
+   reachable, skill visible to this profile.
+2. **Choose the source with the user.** Run `--list-projects` and ask which
+   project, or ask for a markdown file or folder. For markdown, read a sample
+   with `read_file` first and confirm it contains *real tasks* — a reading list
+   or an article summary is not a task list, and rewarding ticks in one makes
+   the numbers meaningless. Completion criterion: one concrete source chosen.
+3. **Run the wizard** — `--setup --yes --project-id <id> --scope <name>`. Ask
+   the user for the scope name and timezone rather than inventing them.
+   Completion criterion: exit 0 and a baseline notice.
+4. **Confirm the baseline awarded nothing.** `--status` must show 0 XP and the
+   ledger must exist. Completion criterion: 0 XP, ledger file present.
+5. **Confirm, then schedule.** Only once the baseline looks right, ask whether
+   to create cron jobs, then create them with `cronjob` (every 15 minutes for
+   near-immediate rewards, hourly for gentler) delivering the script's stdout.
+   Completion criterion: the job appears in `cronjob(action='list')`.
+6. **Add an evening `--streak-check` job.** The highest-value notification in
+   the whole skill — it warns before a streak is lost rather than celebrating
+   after the fact.
 
 ## Mechanics
 
@@ -185,6 +214,21 @@ Run the setup conversationally — do not hand the user a config file to edit.
 - **Never unlock achievements while rendering.** Unlocking pays XP; if a display
   path could unlock, every `--status` would mint free levels. Keep the split
   between `check_achievements()` (writes) and `earned_achievements()` (reads).
+- **Credentials live in .env files, and there is more than one.** Profiles each
+  have their own `.env`. Never hardcode a single path — that is how a skill
+  works for its author and fails for everyone else. `find_token()` searches
+  `$HERMES_HOME/.env`, then `~/.hermes/.env`, then every `profiles/*/.env`, and
+  `--doctor` names the file it used. Never print the token, only its source.
+- **A cron run has no shell profile.** Anything that only reads the exported
+  environment works interactively and dies on schedule. Resolve credentials
+  from the filesystem, not just `os.environ`.
+- **Profiles are islands.** Installing this skill into the default profile does
+  not make it visible to a named profile such as a health or finance bot — each
+  has its own skills directory. Copy it into every profile that needs it, and
+  let `--doctor` confirm visibility rather than assuming.
+- **One writer per ledger.** If two profiles both `--poll` the same scope they
+  share a ledger and race, even with the file lock. Let one profile own the
+  polling and let others read `--status`.
 
 ## Verification
 

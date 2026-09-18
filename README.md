@@ -43,14 +43,28 @@ Requires Python 3.9+. There are no dependencies — standard library only.
 ## Quick start
 
 ```bash
-# 1. write a config (see templates/config.example.json)
-cp templates/config.example.json ~/.hermes/task-rewards.json
+# 1. set up — detects your task source, writes a config, runs a baseline
+python3 scripts/rewards.py --setup
 
-# 2. first poll establishes a baseline and awards nothing
-python3 scripts/rewards.py --config ~/.hermes/task-rewards.json --poll
-
-# 3. check in any time
+# 2. check in any time
 python3 scripts/rewards.py --config ~/.hermes/task-rewards.json --status
+```
+
+`--setup` is the entry point. It finds your Todoist token and lists your real
+projects, or takes a markdown file or folder, then writes the config and
+establishes a baseline that awards nothing — so years of history never flood in.
+
+It runs interactively on a TTY, or non-interactively when an agent drives it:
+
+```bash
+python3 scripts/rewards.py --setup --list-projects
+python3 scripts/rewards.py --setup --yes --project-id <id> --scope health
+```
+
+Something wrong? `--doctor` reports the environment and writes nothing:
+
+```bash
+python3 scripts/rewards.py --config ~/.hermes/task-rewards.json --doctor
 ```
 
 `--poll` prints nothing when nothing was completed. Add it to cron every 15
@@ -60,6 +74,9 @@ minutes and forget about it.
 
 | Command | Purpose |
 |---|---|
+| `--setup` | First run: detect, write config, baseline dry-run |
+| `--doctor` | Report the environment; read-only |
+| `--list-projects` | List Todoist projects with their ids |
 | `--poll` | Fetch completions, award XP, print a reward block (empty if none) |
 | `--status` | Level, streak, totals, achievement list with progress |
 | `--status --compact` | Two lines only |
