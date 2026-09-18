@@ -61,6 +61,17 @@ python3 scripts/rewards.py --setup --list-projects
 python3 scripts/rewards.py --setup --yes --project-id <id> --scope health
 ```
 
+**`--setup --auto` is the zero-touch install path** — the one a Hermes
+install hook should call right after dropping this skill into a profile.
+No prompts, no flags to fill in: Todoist if a token is already configured
+(picking the "Inbox" project, or the first one, without asking) → else the
+first existing checklist found under a common notes location → else a fresh
+blank checklist created for you. It always ends with something active.
+
+```bash
+python3 scripts/rewards.py --setup --auto
+```
+
 Something wrong? `--doctor` reports the environment and writes nothing:
 
 ```bash
@@ -75,6 +86,7 @@ minutes and forget about it.
 | Command | Purpose |
 |---|---|
 | `--setup` | First run: detect, write config, baseline dry-run |
+| `--setup --auto` | Zero-touch install: Todoist → existing checklist → blank checklist |
 | `--doctor` | Report the environment; read-only |
 | `--list-projects` | List Todoist projects with their ids |
 | `--poll` | Fetch completions, award XP, print a reward block (empty if none) |
@@ -82,6 +94,21 @@ minutes and forget about it.
 | `--status --compact` | Two lines only |
 | `--streak-check` | Evening warning before a streak is lost (empty if safe) |
 | `--ledger` | Dump the raw ledger as JSON |
+| `--json` | Machine-readable output for `--poll`/`--status`/`--streak-check`, for driving this from any bot |
+
+Flags combine: `--poll --status` runs the poll quietly and prints the
+resulting status in one call — handy for a bot that wants "sync, then tell
+me where things stand" without two round trips. Add `--json` to get one
+merged object back instead of text (a single flag's own result comes back
+flat; combining flags nests each under its own key).
+
+## Profiles
+
+Every default path — the config, the ledger, and the Todoist `.env` lookup —
+resolves under `$HERMES_HOME` when it's set, falling back to `~/.hermes`.
+Installing this skill into a second Hermes profile (a health bot, a finance
+bot, ...) just works without passing `--config`/`--ledger-path` by hand, the
+same way the token lookup already worked per-profile.
 
 ## Backends
 
@@ -162,6 +189,18 @@ Things that were deliberately **not** built, and why:
 - **Unlocking is separated from rendering** — `check_achievements()` pays
   bonuses; `earned_achievements()` is read-only. If rendering could unlock,
   every `--status` would mint free levels.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Stdlib `unittest` only, matching the rest of the project — no test runner to
+install. Covers the scoring engine, all three backends (including a
+subprocess-level `--setup --auto` install simulation), and the ledger
+lock/dedupe correctness that only shows up under concurrent or long-running
+use.
 
 ## License
 

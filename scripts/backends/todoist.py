@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import profile_paths  # noqa: E402
 
 SOURCE = "todoist"
 API = "https://api.todoist.com/api/v1"
@@ -28,10 +32,7 @@ def env_candidates() -> list[Path]:
     .env. Hardcoding one path is what makes a skill work for its author and
     fail for everyone else.
     """
-    out: list[Path] = []
-    home = os.environ.get("HERMES_HOME")
-    if home:
-        out.append(Path(home) / ".env")
+    out: list[Path] = [profile_paths.hermes_home() / ".env"]
     out.append(Path.home() / ".hermes" / ".env")
     profiles = Path.home() / ".hermes" / "profiles"
     if profiles.is_dir():
@@ -108,7 +109,8 @@ def list_projects() -> list[dict]:
 
 def list_completions(since_iso: str, cfg: dict) -> list[dict]:
     token = _token()
-    project_id = str((cfg.get("backend_options") or {}).get("project_id") or "")
+    backend_options = cfg.get("backend_options") or {}
+    project_id = str(backend_options.get("project_id") or "")
 
     # Completions stream A: the by_completion_date log. This reliably carries
     # one-off (non-recurring) completions, but RECURRING tasks that reset for
@@ -143,7 +145,9 @@ def list_completions(since_iso: str, cfg: dict) -> list[dict]:
             # Todoist's API integer is INVERTED vs the app's P1-P4 labels:
             # 4 = urgent (app P1). Passed through as the raw integer.
             "priority": str(item.get("priority") or 1),
-            "category": str(cfg["backend_options"].get("category") or ""),
+            # A project-scoped ledger maps to one category, so the per-category
+            # achievement ladders follow the ledger's own scope. Overridable.
+            "category": str(backend_options.get("category") or ""),
             "source": SOURCE,
         })
 
@@ -174,7 +178,7 @@ def list_completions(since_iso: str, cfg: dict) -> list[dict]:
                 "title": (t.get("content") or "task")[:80],
                 "completed_at": dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "priority": str(t.get("priority") or 1),
-                "category": str(cfg["backend_options"].get("category") or ""),
+                "category": str(backend_options.get("category") or ""),
                 "source": SOURCE,
             })
 

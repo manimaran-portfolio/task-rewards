@@ -130,15 +130,22 @@ def list_completions(since_iso: str, cfg: dict) -> list[dict]:
         since_dt = datetime.fromisoformat(str(since_iso).replace("Z", "+00:00"))
     except (ValueError, TypeError):
         since_dt = None
-    out: list[dict] = []
-    occurrences: dict[str, int] = {}
 
-    for f in _iter_files(root):
+    # Pass 1: collect every match with its file scan position, but assign no
+    # id yet. Numbering duplicates by scan-encounter order (as this used to
+    # do) means inserting a new same-text task earlier in a file shifts the
+    # "#2"/"#3" suffix of every later duplicate, changing an ALREADY-REWARDED
+    # task's identity and letting it be paid again (or dropping a genuinely
+    # new one as already-seen). Sorting each duplicate group by its own
+    # completion date first makes the numbering depend on the tasks' own
+    # content, not on where a later edit happens to land in the file.
+    matches: list[dict] = []
+    for file_idx, f in enumerate(_iter_files(root)):
         try:
             lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
-        for line in lines:
+        for line_idx, line in enumerate(lines):
             body = None
             done_at = ""
             prio = "1"
@@ -160,11 +167,24 @@ def list_completions(since_iso: str, cfg: dict) -> list[dict]:
                 # time; the engine's day-granular key keeps this idempotent.
                 done_at = now_iso
 
-            base = _task_id(body)
-            n = occurrences.get(base, 0) + 1
-            occurrences[base] = n
-            tid = base if n == 1 else f"{base}#{n}"
+            matches.append({
+                "base": _task_id(body),
+                "body": body,
+                "done_at": done_at,
+                "priority": prio,
+                "category": _category(body, f, root.is_dir()),
+                "order": (done_at, file_idx, line_idx),
+            })
 
+    # Pass 2: number duplicates within each base id by that stable order.
+    groups: dict[str, list[dict]] = {}
+    for rec in matches:
+        groups.setdefault(rec["base"], []).append(rec)
+    out: list[dict] = []
+    for base, recs in groups.items():
+        recs.sort(key=lambda r: r["order"])
+        for n, rec in enumerate(recs, start=1):
+            done_at = rec["done_at"]
             # Watermark filter, at DAY granularity. File-recorded dates carry
             # no time, so comparing instants drops anything completed earlier
             # the same day the watermark was set.
@@ -175,13 +195,12 @@ def list_completions(since_iso: str, cfg: dict) -> list[dict]:
                     done_dt = datetime.now(timezone.utc)
                 if done_dt.date() < since_dt.date():
                     continue
-
             out.append({
-                "id": tid,
-                "title": _clean_title(body),
+                "id": base if n == 1 else f"{base}#{n}",
+                "title": _clean_title(rec["body"]),
                 "completed_at": done_at,
-                "priority": prio,
-                "category": _category(body, f, root.is_dir()),
+                "priority": rec["priority"],
+                "category": rec["category"],
                 "source": SOURCE,
             })
     return out

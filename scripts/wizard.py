@@ -23,8 +23,20 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import profile_paths  # noqa: E402
+
 DEFAULT_TIMEZONE = "America/Toronto"
 DEFAULT_XP = {"4": 50, "3": 30, "2": 20, "1": 10}
+
+# Common places a checklist might already live, for --setup --auto. Only a
+# directory that actually contains a checkbox/todo.txt line we understand
+# gets adopted — a folder of prose notes must never become a "task list".
+COMMON_CHECKLIST_ROOTS = (
+    "~/Documents", "~/Obsidian", "~/obsidian", "~/notes", "~/Notes",
+    "~/vault", "~/Vault", "~/.hermes",
+)
+MAX_AUTO_SCAN_FILES = 300
 
 
 # --------------------------------------------------------------------------
@@ -203,6 +215,93 @@ def cmd_doctor(cfg_path: Path) -> int:
 # setup
 # --------------------------------------------------------------------------
 
+def _scan_for_checklist() -> Path | None:
+    """First existing common location that already contains a real checklist.
+
+    Caps how much it reads (MAX_AUTO_SCAN_FILES) so an install-time scan of a
+    huge notes vault can't hang; that means it can miss one buried deep, but
+    a fast, mostly-right auto-detect beats a slow, exhaustive one here — the
+    user can always point --path at the right folder by hand afterwards.
+    """
+    here = Path(__file__).resolve().parent
+    sys.path.insert(0, str(here))
+    from backends.markdown import MD_CHECKBOX, TODOTXT  # noqa: E402
+    scanned = 0
+    for root in COMMON_CHECKLIST_ROOTS:
+        p = Path(root).expanduser()
+        if not p.is_dir():
+            continue
+        for md in sorted(p.rglob("*.md")):
+            if scanned >= MAX_AUTO_SCAN_FILES:
+                return None
+            scanned += 1
+            try:
+                lines = md.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            if any(MD_CHECKBOX.match(line) or TODOTXT.match(line) for line in lines):
+                return p
+    return None
+
+
+def _auto_detect(args) -> None:
+    """Fill in backend/project_id/path/scope for `--setup --auto`.
+
+    Priority, matching the skill's own doc for how it should install itself:
+    Todoist (if a token is already reachable) > an existing checklist found
+    in a common location > a fresh blank checklist. Never prompts — this is
+    meant to run unattended right after the skill is installed, so it always
+    ends with something active rather than stuck waiting on the user.
+    """
+    args.yes = True
+    if getattr(args, "backend", None):
+        return  # caller (or a previous --setup flag) already pinned one
+
+    here = Path(__file__).resolve().parent
+    sys.path.insert(0, str(here))
+    from backends import todoist  # noqa: E402
+    token, _src = todoist.find_token()
+    if token:
+        args.backend = "todoist"
+        if not getattr(args, "project_id", None):
+            try:
+                projects = todoist.list_projects()
+            except Exception:  # noqa: BLE001
+                projects = []
+            pick = next((p for p in projects
+                        if str(p.get("name", "")).strip().lower() == "inbox"), None)
+            pick = pick or (projects[0] if projects else None)
+            if pick:
+                args.project_id = pick.get("id")
+                if not getattr(args, "scope", None):
+                    args.scope = slugify(pick.get("name") or "tasks")
+        return
+
+    found = _scan_for_checklist()
+    if found:
+        args.backend = "markdown"
+        args.path = str(found)
+        if not getattr(args, "scope", None):
+            args.scope = slugify(found.name)
+        return
+
+    # Nothing to adopt: create a fresh plain checklist rather than leaving
+    # the install with no active source at all.
+    blank = profile_paths.default_checklist_path()
+    if not blank.exists():
+        blank.parent.mkdir(parents=True, exist_ok=True)
+        blank.write_text(
+            "# Tasks\n\n"
+            "Check items off as you complete them — task-rewards polls this file.\n\n"
+            "- [ ] Add your first task here\n",
+            encoding="utf-8",
+        )
+    args.backend = "markdown"
+    args.path = str(blank)
+    if not getattr(args, "scope", None):
+        args.scope = "tasks"
+
+
 def _backend_choices() -> dict:
     """What task sources look usable right now."""
     here = Path(__file__).resolve().parent
@@ -214,13 +313,20 @@ def _backend_choices() -> dict:
 
 def cmd_setup(args) -> int:
     """Discover, confirm, write, and dry-run. Returns a shell exit code."""
-    assume_yes = bool(getattr(args, "yes", False))
     cfg_path = Path(os.path.expanduser(args.config))
     force = bool(getattr(args, "force", False))
 
     print("task-rewards \u2014 setup")
     print("=" * 40)
     print()
+
+    if getattr(args, "auto", False):
+        _auto_detect(args)
+        print(f"0. Auto-detect: backend={args.backend}"
+              + (f"  project_id={args.project_id}" if getattr(args, "project_id", None) else "")
+              + (f"  path={_short(args.path)}" if getattr(args, "path", None) else ""))
+        print()
+    assume_yes = bool(getattr(args, "yes", False))
 
     if cfg_path.is_file() and not force:
         try:
@@ -358,8 +464,14 @@ def cmd_setup(args) -> int:
     scope = slugify(scope)
     print(f"   {_tick(True)} scope: {scope}")
 
-    category = getattr(args, "category", None) or scope
-    backend_options.setdefault("category", category)
+    # Only the Todoist backend actually reads backend_options["category"] — it
+    # has no other way to classify a completion. markdown/json backends derive
+    # a category from each task's own tag/folder/field, so writing one here
+    # for them would be a config value that looks meaningful but is silently
+    # ignored.
+    if backend == "todoist":
+        category = getattr(args, "category", None) or scope
+        backend_options.setdefault("category", category)
 
     tzname = getattr(args, "timezone", None)
     if not tzname:
@@ -369,8 +481,7 @@ def cmd_setup(args) -> int:
     print()
 
     # ---- 4. write ---------------------------------------------------------
-    ledger = str(getattr(args, "ledger_file", None) or
-                 Path.home() / ".hermes" / f"task-rewards-{scope}-ledger.json")
+    ledger = str(getattr(args, "ledger_file", None) or profile_paths.default_ledger_path(scope))
     cfg = {
         "scope": scope,
         "active": True,
@@ -400,8 +511,10 @@ def cmd_setup(args) -> int:
     try:
         state = rewards.load_json(Path(os.path.expanduser(ledger)),
                                   rewards.default_state(scope))
-        out = rewards.cmd_poll(cfg, state, Path(os.path.expanduser(ledger)), quiet=False)
-        print(f"   {_tick(True)} {out or 'baseline set'}")
+        result = rewards.cmd_poll(cfg, state, Path(os.path.expanduser(ledger)))
+        msg = (f"Baseline set — {result['baseline_count']} existing completion(s) recorded, "
+              "no XP awarded. Rewards start from now.") if result.get("baseline") else "baseline set"
+        print(f"   {_tick(True)} {msg}")
     except Exception as exc:  # noqa: BLE001
         print(f"   {_tick(False)} {type(exc).__name__}: {str(exc)[:100]}")
         print("   config was written; fix the error and re-run --poll")

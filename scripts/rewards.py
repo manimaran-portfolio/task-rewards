@@ -19,6 +19,9 @@ import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import profile_paths  # noqa: E402
+
 VERSION = 1
 DEFAULT_XP = {"4": 50, "3": 30, "2": 20, "1": 10}
 FREEZE_EVERY = 7
@@ -259,26 +262,35 @@ def apply_completion(state: dict, xp: int, today: date,
     return state
 
 
-def expire_streak(state: dict, today: date) -> str | None:
-    """Detect a missed day. Returns an advisory string, or None."""
+def effective_streak(state: dict, today: date) -> tuple[int, bool]:
+    """The streak as it actually stands today, without mutating the ledger.
+
+    `streak_days` in the ledger is only ever corrected by apply_completion, on
+    the NEXT real completion — there is no cron job that walks in and zeroes
+    it out. That is fine for scoring (a freeze/reset is applied correctly the
+    moment it matters) but it means a stale in-ledger streak_days can lag
+    reality by several silent days. Every renderer and the streak-check
+    warning must go through this instead of reading state["streak_days"]
+    directly, so display is never more optimistic than the truth.
+
+    Returns (effective_streak_days, still_protected_by_a_freeze).
+    """
+    streak = state.get("streak_days", 0)
     last = state.get("last_active_date")
-    if not last or state.get("streak_days", 0) == 0:
-        return None
+    if not last or streak == 0:
+        return streak, False
     try:
         last_d = date.fromisoformat(last)
     except ValueError:
-        return None
+        return streak, False
     gap = (today - last_d).days
     if gap <= 1:
-        return None
+        return streak, False
     if state.get("freezes", 0) > 0:
-        return f"Streak saved by a freeze ({state['freezes']} left)."
-    if state.get("streak_days", 0) > 0:
-        state["streak_days"] = 0
-        # Framed as a beginning, never a loss. Punishment framing is what makes
-        # people quit a streak system outright.
-        return "A new streak starts today."
-    return None
+        return streak, True  # a freeze covers exactly this one gap, not consumed until it's real
+    # Framed as a beginning, never a loss, once the caller surfaces this: punishment
+    # framing is what makes people quit a streak system outright.
+    return 0, False
 
 
 def _progress(state: dict, key: str, target: int) -> int:
@@ -353,57 +365,89 @@ def bar(current: int, target: int, width: int = 10) -> str:
     return "▰" * filled + "▱" * (width - filled)
 
 
-def render_poll(state: dict, batch: list[dict]) -> str:
+def status_payload(state: dict, scope: str, today: date) -> dict:
+    """Everything --status (and a bot's --status --json) needs, computed once.
+
+    Achievement unlock/progress is derived here from the live counters on
+    every call — nothing here is a stored "is unlocked" flag being replayed.
+    The only thing ever persisted about an achievement is that its one-time
+    bonus was already paid (see check_achievements), which is a dedupe
+    concern, not the source of truth for whether it's earned.
+    """
+    streak_days, protected = effective_streak(state, today)
+    need = xp_to_next(state["level"])
+    achs = [
+        {"key": key, "label": label, "unlocked": unlocked, "current": cur, "target": target}
+        for key, label, unlocked, cur, target in earned_achievements(state)
+    ]
+    return {
+        "scope": scope,
+        "level": state["level"],
+        "max_level": need == 0,
+        "xp_into_level": state.get("xp_into_level", 0),
+        "xp_to_next_level": need,
+        "total_xp": state.get("total_xp", 0),
+        "tasks_completed": state.get("tasks_completed", 0),
+        "streak_days": streak_days,
+        "streak_protected_by_freeze": protected,
+        "longest_streak": state.get("longest_streak", 0),
+        "freezes": state.get("freezes", 0),
+        "achievements_unlocked": sum(1 for a in achs if a["unlocked"]),
+        "achievements_total": len(achs),
+        "achievements": achs,
+    }
+
+
+def render_poll(payload: dict) -> str:
     """The completion ping. Empty string when there is nothing to say."""
+    batch = payload["batch"]
     if not batch:
         return ""
-    gained = sum(b["xp"] + b.get("bonus", 0) for b in batch)
-    bonus_total = sum(b.get("bonus", 0) for b in batch)
-    gained += state.get("_achievement_bonus", 0)
-    lines = [f"⚡ +{gained} XP", ""]
+    lines = [f"⚡ +{payload['gained']} XP", ""]
     for b in batch[:8]:
         lines.append(f"{b['title'][:38]:<38} +{b['xp']}")
-    if bonus_total:
-        lines.append(f"{'🔥 daily streak bonus':<38} +{bonus_total}")
+    if payload["bonus_total"]:
+        lines.append(f"{'🔥 daily streak bonus':<38} +{payload['bonus_total']}")
     if len(batch) > 8:
         lines.append(f"...and {len(batch) - 8} more")
     # The legs of the ladder that were rolled into levels, then the streak
     # milestone. Only a rationed subset gets an emphasised line.
     lines.append("")
-    for line in (state.get("_emphasis") or []):
+    for line in payload["emphasis"]:
         lines.append(line)
-    need = xp_to_next(state["level"])
-    if need:
-        lines.append(f"🏆 Level {state['level']}  {bar(state['xp_into_level'], need)}  {state['xp_into_level']}/{need} XP")
+    if payload["xp_to_next_level"]:
+        lines.append(f"🏆 Level {payload['level']}  {bar(payload['xp_into_level'], payload['xp_to_next_level'])}  "
+                     f"{payload['xp_into_level']}/{payload['xp_to_next_level']} XP")
     else:
-        lines.append(f"🏆 Level {state['level']} — MAX")
-    lines.append(f"🔥 Streak {state['streak_days']}d (best {state.get('longest_streak', 0)}d)   🛡️ {state.get('freezes', 0)} freeze")
+        lines.append(f"🏆 Level {payload['level']} — MAX")
+    lines.append(f"🔥 Streak {payload['streak_days']}d (best {payload['longest_streak']}d)   "
+                 f"🛡️ {payload['freezes']} freeze")
     return "\n".join(lines)
 
 
-def render_status(state: dict, scope: str, compact: bool = False) -> str:
-    need = xp_to_next(state["level"])
+def render_status(payload: dict, compact: bool = False) -> str:
     level_line = (
-        f"Level {state['level']}   {bar(state['xp_into_level'], need)}   {state['xp_into_level']}/{need} XP"
-        if need else f"Level {state['level']} — MAX"
+        f"Level {payload['level']}   {bar(payload['xp_into_level'], payload['xp_to_next_level'])}   "
+        f"{payload['xp_into_level']}/{payload['xp_to_next_level']} XP"
+        if payload["xp_to_next_level"] else f"Level {payload['level']} — MAX"
     )
+    streak_suffix = "  (protected by a freeze)" if payload["streak_protected_by_freeze"] else ""
     head = [
-        f"🏆 Rewards — {scope}",
+        f"🏆 Rewards — {payload['scope']}",
         "",
         level_line,
-        f"🔥 Streak {state['streak_days']}d (best {state.get('longest_streak', 0)}d)   🛡️ {state.get('freezes', 0)} freeze banked",
-        f"📊 {state.get('tasks_completed', 0)} tasks · {state.get('total_xp', 0)} XP lifetime",
+        f"🔥 Streak {payload['streak_days']}d (best {payload['longest_streak']}d)   "
+        f"🛡️ {payload['freezes']} freeze banked{streak_suffix}",
+        f"📊 {payload['tasks_completed']} tasks · {payload['total_xp']} XP lifetime",
     ]
     if compact:
         return "\n".join(head[:3])
-    achs = earned_achievements(state)
-    got = sum(1 for a in achs if a[2])
-    head += ["", f"Achievements   {got} / {len(achs)}"]
-    for _key, label, unlocked, cur, target in achs:
-        if unlocked:
-            head.append(f"✅ {label}")
+    head += ["", f"Achievements   {payload['achievements_unlocked']} / {payload['achievements_total']}"]
+    for a in payload["achievements"]:
+        if a["unlocked"]:
+            head.append(f"✅ {a['label']}")
         else:
-            head.append(f"🔒 {label}  ({cur}/{target})")
+            head.append(f"🔒 {a['label']}  ({a['current']}/{a['target']})")
     return "\n".join(head)
 
 
@@ -448,9 +492,23 @@ def default_state(scope: str) -> dict:
     }
 
 
-def cmd_poll(cfg: dict, state: dict, ledger_path: Path, quiet: bool) -> str:
+def _strip_transient(state: dict) -> None:
+    """Drop the per-call scratch keys (``_bonus``, ``_leveled``, ...) before
+    a write. They exist only to hand a value from a helper back to cmd_poll
+    within one call; persisting them let ``_leveled`` grow forever across
+    polls (it was being read back and appended to on the next run) and leaked
+    into ``--ledger`` output. Everything a caller needs comes back in the
+    payload dict instead."""
+    for key in [k for k in state if k.startswith("_")]:
+        del state[key]
+
+
+def cmd_poll(cfg: dict, state: dict, ledger_path: Path) -> dict:
+    """Fetch completions, award XP, persist. Never prints — returns a payload
+    dict so the caller (text renderer, --json, or a future non-CLI embedder)
+    decides what, if anything, to show."""
     if not cfg.get("active", True):
-        return ""  # paused: no awards, no notifications, no state churn
+        return {"active": False, "baseline": False, "batch": []}  # paused: no awards, no state churn
 
     backend = load_backend(cfg["backend"])
     today = local_today(cfg.get("timezone", "UTC"))
@@ -466,75 +524,96 @@ def cmd_poll(cfg: dict, state: dict, ledger_path: Path, quiet: bool) -> str:
         state["baseline_at"] = now_utc().isoformat()
         state["last_poll"] = now_utc().isoformat()
         atomic_write_json(ledger_path, state)
-        if quiet:
-            return ""
-        return (
-            f"Baseline set — {len(existing)} existing completion(s) recorded, "
-            "no XP awarded. Rewards start from now."
-        )
+        return {"active": True, "baseline": True, "baseline_count": len(existing), "batch": []}
 
     records = backend.list_completions(since, cfg)
-    seen = set(state.get("processed", []))
+    # An ordered list, not just a set: SEEN_CAP truncation below must evict the
+    # OLDEST keys. A set has no reliable iteration order, so capping straight
+    # off `set(...)` could evict a key added this very poll and re-admit an
+    # ancient one — silently letting a task double-pay once it cycles back in.
+    seen_list = list(state.get("processed", []))
+    seen_set = set(seen_list)
     batch = []
+    leveled: list[int] = []
     for raw in records:
         rec = normalize_record(raw)
         if rec is None:
             continue  # malformed backend output must never reach the scoring path
         key = dedupe_key(rec)
-        if key in seen:
+        if key in seen_set:
             continue
-        seen.add(key)
+        seen_set.add(key)
+        seen_list.append(key)
         xp = score(rec, cfg.get("xp", DEFAULT_XP))
         apply_completion(state, xp, today, rec["category"])
+        # apply_completion reports level-ups from THIS completion only; collect
+        # them here rather than letting a later completion in the same batch
+        # overwrite them, or a level-up from completion #1 of 5 vanishes.
+        leveled.extend(state.get("_leveled") or [])
         batch.append({"title": rec["title"], "xp": xp, "bonus": state.get("_bonus", 0)})
 
+    newly = []
+    emphasis: list[str] = []
     if batch:
-        state["processed"] = list(seen)[-SEEN_CAP:]
+        state["processed"] = seen_list[-SEEN_CAP:]
         # Achievement bonuses can themselves roll into a level, so run the
         # level pass again and append anything it produced.
         newly = check_achievements(state)
-        state["_leveled"] = (state.get("_leveled") or []) + _advance_levels(state)
+        leveled.extend(_advance_levels(state))
         # Rationed emphasis: a level-up outranks a new achievement, and the cap
         # means the third thing today reports plainly instead of shouting.
-        emphasis = []
-        if state.get("_leveled") and take_highlight(state, today):
-            emphasis.append(f"🎉 LEVEL UP — Level {state['_leveled'][-1]}!")
+        if leveled and take_highlight(state, today):
+            emphasis.append(f"🎉 LEVEL UP — Level {leveled[-1]}!")
         for label, bonus in newly:
             if take_highlight(state, today):
                 emphasis.append(f"🏅 {label} unlocked!  +{bonus} XP")
-        state["_emphasis"] = emphasis
-        state["_achievement_bonus"] = sum(b for _label, b in newly)
     state["baseline_at"] = now_utc().isoformat()
     state["last_poll"] = now_utc().isoformat()
+    _strip_transient(state)
     atomic_write_json(ledger_path, state)
 
-    if quiet or cfg.get("notify") == "off":
-        return ""
-    return render_poll(state, batch)
+    achievement_bonus = sum(b for _label, b in newly)
+    gained = sum(b["xp"] + b.get("bonus", 0) for b in batch) + achievement_bonus
+    bonus_total = sum(b.get("bonus", 0) for b in batch)
+    return {
+        "active": True,
+        "baseline": False,
+        "batch": batch,
+        "gained": gained,
+        "bonus_total": bonus_total,
+        "achievement_bonus": achievement_bonus,
+        "unlocked": [{"label": label, "bonus": bonus} for label, bonus in newly],
+        "leveled_to": leveled,
+        "emphasis": emphasis,
+        "level": state["level"],
+        "xp_into_level": state.get("xp_into_level", 0),
+        "xp_to_next_level": xp_to_next(state["level"]),
+        "streak_days": state.get("streak_days", 0),
+        "longest_streak": state.get("longest_streak", 0),
+        "freezes": state.get("freezes", 0),
+        "notify": cfg.get("notify", "digest"),
+    }
 
 
-def cmd_streak_check(cfg: dict, state: dict, ledger_path: Path) -> str:
-    """Evening defense: warn BEFORE the streak is lost, not after."""
-    if not cfg.get("active", True):
-        return ""
+def cmd_streak_check(cfg: dict, state: dict) -> dict:
+    """Evening defense: warn BEFORE the streak is lost, not after.
+
+    Read-only — writes nothing, since it never changes the ledger's own
+    numbers (see effective_streak: that correction lands for real on the
+    next completion, not here).
+    """
     today = local_today(cfg.get("timezone", "UTC"))
-    if state.get("last_active_date") == today.isoformat():
-        return ""
-    if state.get("streak_days", 0) <= 0:
-        return ""
+    if not cfg.get("active", True):
+        return {"active": False, "warning": None}
+    streak_days, protected = effective_streak(state, today)
+    if state.get("last_active_date") == today.isoformat() or streak_days <= 0:
+        return {"active": True, "warning": None, "streak_days": streak_days, "freezes": state.get("freezes", 0)}
     freezes = state.get("freezes", 0)
-    if freezes > 0:
-        return f"⚠️ No completions today. Streak {state['streak_days']}d saved by a freeze ({freezes} left)."
-    return f"⚠️ No completions today — your {state['streak_days']}-day streak ends at midnight."
-
-
-def _discover_configs() -> list[Path]:
-    """Existing task-rewards configs, for a helpful message when none is given."""
-    root = Path.home() / ".hermes"
-    found: list[Path] = []
-    for pat in ("task-rewards*.json", "profiles/*/task-rewards*.json"):
-        found.extend(sorted(root.glob(pat)))
-    return [p for p in found if not p.name.endswith("-ledger.json")]
+    if protected and freezes > 0:
+        warning = f"⚠️ No completions today. Streak {streak_days}d saved by a freeze ({freezes} left)."
+    else:
+        warning = f"⚠️ No completions today — your {streak_days}-day streak ends at midnight."
+    return {"active": True, "warning": warning, "streak_days": streak_days, "freezes": freezes}
 
 
 def main(argv=None) -> int:
@@ -543,17 +622,25 @@ def main(argv=None) -> int:
         description="task-rewards \u2014 XP, levels and streaks for completed tasks",
         epilog="First time? Run --setup. Something broken? Run --doctor.",
     )
-    ap.add_argument("--config", default=str(Path.home() / ".hermes" / "task-rewards.json"),
-                    help="path to config JSON (default: ~/.hermes/task-rewards.json)")
+    ap.add_argument("--config", default=str(profile_paths.default_config_path()),
+                    help="path to config JSON (default: $HERMES_HOME/task-rewards.json, "
+                         "else ~/.hermes/task-rewards.json)")
     ap.add_argument("--poll", action="store_true", help="fetch completions and award")
     ap.add_argument("--status", action="store_true", help="print player status")
     ap.add_argument("--compact", action="store_true", help="short status")
     ap.add_argument("--streak-check", action="store_true", help="evening streak warning")
     ap.add_argument("--ledger", action="store_true", help="dump raw ledger as JSON")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable output for --poll/--status/--streak-check, "
+                         "for driving this from a bot other than the Hermes agent")
 
     setup_grp = ap.add_argument_group("setup")
     setup_grp.add_argument("--setup", action="store_true",
                            help="run the interactive setup wizard")
+    setup_grp.add_argument("--auto", action="store_true",
+                           help="with --setup, fully non-interactive install-time detection: "
+                                "Todoist if a token is already configured, else the first "
+                                "existing checklist found, else a fresh blank one")
     setup_grp.add_argument("--doctor", action="store_true",
                            help="report the environment and exit (read-only)")
     setup_grp.add_argument("--list-projects", action="store_true",
@@ -598,7 +685,7 @@ def main(argv=None) -> int:
     if not cfg:
         print(f"task-rewards: no config at {str(cfg_path).replace(str(Path.home()), '~', 1)}",
               file=sys.stderr)
-        others = _discover_configs()
+        others = profile_paths.discover_configs()
         if others:
             print("  found existing config(s):", file=sys.stderr)
             for p in others:
@@ -608,36 +695,62 @@ def main(argv=None) -> int:
         print(f"  or run:  python3 {me} --setup", file=sys.stderr)
         return 2
 
+    if not (args.ledger or args.status or args.streak_check or args.poll):
+        ap.print_help()
+        return 1
+
     ledger_path = Path(os.path.expanduser(cfg["ledger"]))
-    state = load_json(ledger_path, default_state(cfg.get("scope", "default")))
+    scope = cfg.get("scope", "default")
 
     lock_path = ledger_path.with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+") as lf:
         release = _lock_handle(lf)
         try:
+            # Loaded AFTER the lock is held, not before: two overlapping
+            # --poll runs (a slow API call plus an unlucky cron overlap)
+            # must not let the second one act on a stale in-memory copy and
+            # clobber the first one's write when it releases the lock.
+            state = load_json(ledger_path, default_state(scope))
+
             if args.ledger:
                 print(json.dumps(state, indent=2, sort_keys=True))
                 return 0
-            if args.status:
-                print(render_status(state, cfg.get("scope", "default"), args.compact))
-                return 0
-            if args.streak_check:
-                msg = cmd_streak_check(cfg, state, ledger_path)
-                if msg:
-                    print(msg)
-                    atomic_write_json(ledger_path, state)
-                return 0
+
+            today = local_today(cfg.get("timezone", "UTC"))
+            results: dict[str, dict] = {}
             if args.poll:
-                out = cmd_poll(cfg, state, ledger_path, quiet=args.status)
-                if out:
-                    print(out)
+                results["poll"] = cmd_poll(cfg, state, ledger_path)
+            if args.status:
+                results["status"] = status_payload(state, scope, today)
+            if args.streak_check:
+                results["streak_check"] = cmd_streak_check(cfg, state)
+
+            if args.json:
+                out = next(iter(results.values())) if len(results) == 1 else results
+                print(json.dumps(out, indent=2, sort_keys=True))
                 return 0
+
+            texts = []
+            if "poll" in results:
+                pr = results["poll"]
+                if pr["active"] and pr["baseline"]:
+                    texts.append(f"Baseline set \u2014 {pr['baseline_count']} existing completion(s) "
+                                 "recorded, no XP awarded. Rewards start from now.")
+                elif pr["active"] and pr.get("notify") != "off":
+                    texts.append(render_poll(pr))
+            if "status" in results:
+                texts.append(render_status(results["status"], args.compact))
+            if "streak_check" in results:
+                sr = results["streak_check"]
+                if sr["active"] and sr["warning"]:
+                    texts.append(sr["warning"])
+            for text in texts:
+                if text:
+                    print(text)
+            return 0
         finally:
             release()
-
-    ap.print_help()
-    return 1
 
 
 if __name__ == "__main__":

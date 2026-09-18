@@ -35,9 +35,34 @@ Todoist or against any markdown checklist. Nothing leaves the machine.
 - A task source:
   - **markdown** — a file or folder of checklists. No account needed.
   - **todoist** — requires `TODOIST_API_TOKEN` in the environment. Read it from
-    `~/.hermes/.env`; never write the token into the config file.
+    `$HERMES_HOME/.env` (falling back to `~/.hermes/.env`); never write the
+    token into the config file.
   - **json** — a JSON array or NDJSON file of completion records.
 - Optional: a messaging platform configured in Hermes, for pushing rewards.
+
+## Installation
+
+Run `--setup --auto` once, right after this skill's files land in a profile's
+skills directory — it needs no arguments and no TTY:
+
+```
+terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --setup --auto")
+```
+
+It cascades: an already-configured Todoist token wins (picks the "Inbox"
+project, or the first one, without asking which); otherwise it scans common
+checklist locations (`~/Documents`, `~/Obsidian`, `~/notes`, `~/.hermes`, ...)
+for a file that already contains real `- [ ]`/`- [x]`/todo.txt lines and
+adopts it; otherwise it creates a fresh blank checklist and uses that. Either
+way the install ends **active**, never stuck waiting on a question. All of
+this respects `$HERMES_HOME`, so installing into a second profile (a health
+bot, a finance bot, ...) gets its own config/ledger automatically — nothing
+to pass by hand.
+
+If the auto-detected source is wrong for this user (wrong Todoist project, or
+it adopted the wrong notes folder), re-run interactively with `--force` and
+the flags in **Setup and Diagnosis** below to override it — auto-detection is
+a good-enough default, not a promise that it read the user's mind.
 
 ## How to Run
 
@@ -106,7 +131,8 @@ The rule: **the script owns the numbers; you own the meaning.**
 
 | Command | Purpose |
 |---|---|
-| `--setup` | **First run.** Detect, write config, baseline dry-run |
+| `--setup --auto` | **Install time.** Zero-touch: Todoist → existing checklist → blank checklist |
+| `--setup` | Detect, write config, baseline dry-run (interactive or flag-driven) |
 | `--doctor` | Report the environment; read-only, writes nothing |
 | `--list-projects` | List Todoist projects with their ids |
 | `--poll` | Fetch completions, award XP, print a reward block (empty if none) |
@@ -114,6 +140,14 @@ The rule: **the script owns the numbers; you own the meaning.**
 | `--status --compact` | Two lines only |
 | `--streak-check` | Evening warning before a streak is lost (empty if safe) |
 | `--ledger` | Dump the raw ledger as JSON |
+| `--json` | Add to `--poll`/`--status`/`--streak-check` for structured output |
+
+`--poll --status` combined runs the poll quietly and shows the resulting
+status in one call. This (with `--json`) is also the integration point for
+a bot that ISN'T you — this skill is a layer between the Todoist/markdown
+source and whatever consumes rewards, and a Discord/Slack bot that has no
+concept of "Hermes skill" can shell out to the same CLI and get a stable
+JSON contract instead of parsing emoji text.
 
 ## Procedure
 
