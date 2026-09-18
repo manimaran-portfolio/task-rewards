@@ -14,10 +14,35 @@ import os
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 SOURCE = "todoist"
 API = "https://api.todoist.com/api/v1"
 MAX_LOOKBACK_DAYS = 7
+
+
+def _token() -> str:
+    """Token from the environment, else from Hermes' .env file.
+
+    A cron run gets no shell profile, so the environment alone is not enough —
+    without this fallback every scheduled poll dies with "not set" while the
+    interactive one works, which is a confusing failure to debug.
+    """
+    tok = os.environ.get("TODOIST_API_TOKEN")
+    if tok:
+        return tok
+    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    env_file = Path(home) / ".env"
+    if env_file.is_file():
+        for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("TODOIST_API_TOKEN="):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if value:
+                    return value
+    raise RuntimeError(
+        f"TODOIST_API_TOKEN is not set and not found in {env_file}"
+    )
 
 
 def _get(url: str, token: str) -> dict:
@@ -29,9 +54,7 @@ def _get(url: str, token: str) -> dict:
 
 
 def list_completions(since_iso: str, cfg: dict) -> list[dict]:
-    token = os.environ.get("TODOIST_API_TOKEN")
-    if not token:
-        raise RuntimeError("TODOIST_API_TOKEN is not set")
+    token = _token()
 
     # The watermark is advisory and clamped: a late sync from an offline
     # device carries an OLD completed_at, so a tight window drops it forever.
