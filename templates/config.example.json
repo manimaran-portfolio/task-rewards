@@ -1,0 +1,13 @@
+{
+  "scope": "health",
+  "active": true,
+  "backend": "todoist",
+  "backend_options": {
+    "project_id": "REPLACE_WITH_TODOIST_PROJECT_ID",
+    "category": "health"
+  },
+  "ledger": "~/.hermes/task-rewards-health.json",
+  "timezone": "America/Toronto",
+  "notify": "digest",
+  "xp": { "4": 50, "3": 30, "2": 20, "1": 10 }
+}
