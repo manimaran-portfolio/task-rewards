@@ -39,6 +39,33 @@ class JsonArrayTests(unittest.TestCase):
         out = json_backend.list_completions("", {"backend_options": {"path": "/no/such/file.json"}})
         self.assertEqual(out, [])
 
+    def test_non_object_array_entries_are_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "mixed.json"
+            f.write_text(jsonlib.dumps([
+                "bad", None,
+                {"id": "ok", "completed_at": "2026-09-18T00:00:00Z"},
+            ]), encoding="utf-8")
+            out = json_backend.list_completions("", {"backend_options": {"path": str(f)}})
+            self.assertEqual([r["id"] for r in out], ["ok"])
+
+    def test_directory_path_returns_empty_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = json_backend.list_completions(
+                "", {"backend_options": {"path": tmp}})
+            self.assertEqual(out, [])
+
+    def test_records_older_than_the_overlap_window_are_not_returned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "history.json"
+            f.write_text(jsonlib.dumps([
+                {"id": "old", "completed_at": "2026-09-01T00:00:00Z"},
+                {"id": "recent", "completed_at": "2026-09-17T12:00:00Z"},
+            ]), encoding="utf-8")
+            out = json_backend.list_completions(
+                "2026-09-18T00:00:00Z", {"backend_options": {"path": str(f)}})
+            self.assertEqual([r["id"] for r in out], ["recent"])
+
 
 class NdjsonTests(unittest.TestCase):
     def test_reads_newline_delimited_json(self):
@@ -56,6 +83,36 @@ class NdjsonTests(unittest.TestCase):
             f.write_text("", encoding="utf-8")
             out = json_backend.list_completions("", {"backend_options": {"path": str(f)}})
             self.assertEqual(out, [])
+
+    def test_one_invalid_line_does_not_abort_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "mixed.ndjson"
+            f.write_text(
+                '{"id":"1","completed_at":"2026-09-18T00:00:00Z"}\n'
+                'not json\n'
+                '{"id":"2","completed_at":"2026-09-18T01:00:00Z"}\n',
+                encoding="utf-8",
+            )
+            out = json_backend.list_completions("", {"backend_options": {"path": str(f)}})
+            self.assertEqual([r["id"] for r in out], ["1", "2"])
+
+
+class ValidationTests(unittest.TestCase):
+    def test_rejects_a_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIn("regular file", json_backend.validate_file(Path(tmp)))
+
+    def test_reports_the_invalid_ndjson_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "bad.ndjson"
+            f.write_text('{"id":"1"}\nnot json\n', encoding="utf-8")
+            self.assertIn("line 2", json_backend.validate_file(f))
+
+    def test_accepts_a_json_array(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "ok.json"
+            f.write_text("[]", encoding="utf-8")
+            self.assertIsNone(json_backend.validate_file(f))
 
 
 if __name__ == "__main__":

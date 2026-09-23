@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 import rewards
 
@@ -68,6 +69,14 @@ class DedupeKeyTests(unittest.TestCase):
         r1 = {"source": "todoist", "id": "1", "completed_at": "2026-09-18T08:00:00Z"}
         r2 = {"source": "markdown", "id": "1", "completed_at": "2026-09-18T08:00:00Z"}
         self.assertNotEqual(rewards.dedupe_key(r1), rewards.dedupe_key(r2))
+
+    def test_uses_user_calendar_date_not_utc_date(self):
+        r1 = {"source": "todoist", "id": "1", "completed_at": "2026-09-19T00:30:00Z"}
+        r2 = {"source": "todoist", "id": "1", "completed_at": "2026-09-18T22:00:00Z"}
+        self.assertEqual(
+            rewards.dedupe_key(r1, "America/Toronto"),
+            rewards.dedupe_key(r2, "America/Toronto"),
+        )
 
 
 class ScoreAndLevelTests(unittest.TestCase):
@@ -139,6 +148,34 @@ class ApplyCompletionTests(unittest.TestCase):
         rewards.apply_completion(state, 10, date(2026, 9, 10))
         self.assertEqual(state["streak_days"], 1)
 
+    def test_one_freeze_does_not_cover_multiple_missed_days(self):
+        state = base_state()
+        state.update({
+            "last_active_date": "2026-09-01", "streak_days": 7,
+            "freezes": 1, "freeze_progress": 0,
+        })
+        rewards.apply_completion(state, 10, date(2026, 9, 4))
+        self.assertEqual(state["streak_days"], 1)
+        self.assertEqual(state["freezes"], 0)
+
+    def test_broken_streak_resets_freeze_progress(self):
+        state = base_state()
+        state.update({
+            "last_active_date": "2026-09-01", "streak_days": 6,
+            "freeze_progress": 6,
+        })
+        rewards.apply_completion(state, 10, date(2026, 9, 3))
+        self.assertEqual(state["streak_days"], 1)
+        self.assertEqual(state["freeze_progress"], 1)
+
+    def test_late_completion_does_not_move_streak_backwards(self):
+        state = base_state()
+        rewards.apply_completion(state, 10, date(2026, 9, 18))
+        rewards.apply_completion(state, 10, date(2026, 9, 17))
+        self.assertEqual(state["last_active_date"], "2026-09-18")
+        self.assertEqual(state["streak_days"], 1)
+        self.assertEqual(state["_bonus"], 0)
+
     def test_category_counter_increments(self):
         state = base_state()
         rewards.apply_completion(state, 10, date(2026, 9, 18), category="health")
@@ -178,9 +215,53 @@ class EffectiveStreakTests(unittest.TestCase):
         for d in range(1, 1 + rewards.FREEZE_EVERY):
             rewards.apply_completion(state, 10, date(2026, 9, d))
         self.assertGreaterEqual(state["freezes"], 1)
-        days, protected = rewards.effective_streak(state, date(2026, 9, 1 + rewards.FREEZE_EVERY + 2))
+        days, protected = rewards.effective_streak(state, date(2026, 9, 1 + rewards.FREEZE_EVERY + 1))
         self.assertTrue(protected)
         self.assertEqual(days, state["streak_days"])
+
+    def test_one_freeze_does_not_display_long_gap_as_protected(self):
+        state = base_state()
+        state.update({"last_active_date": "2026-09-01", "streak_days": 7, "freezes": 1})
+        days, protected = rewards.effective_streak(state, date(2026, 9, 4))
+        self.assertEqual(days, 0)
+        self.assertFalse(protected)
+
+
+class PollCompletionDateTests(unittest.TestCase):
+    def test_poll_applies_records_on_their_completion_dates(self):
+        records = [
+            {"id": "2", "title": "today", "completed_at": "2026-09-18T12:00:00Z",
+             "priority": 1, "source": "fake"},
+            {"id": "1", "title": "yesterday", "completed_at": "2026-09-17T12:00:00Z",
+             "priority": 1, "source": "fake"},
+        ]
+        backend = mock.Mock()
+        backend.list_completions.return_value = records
+        cfg = {"backend": "fake", "timezone": "UTC", "xp": rewards.DEFAULT_XP}
+        state = base_state()
+        state["baseline_at"] = "2026-09-16T00:00:00Z"
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(rewards, "load_backend", return_value=backend), \
+             mock.patch.object(rewards, "local_today", return_value=date(2026, 9, 18)):
+            rewards.cmd_poll(cfg, state, Path(tmp) / "ledger.json")
+        self.assertEqual(state["streak_days"], 2)
+        self.assertEqual(state["last_active_date"], "2026-09-18")
+
+    def test_poll_ignores_future_dated_records(self):
+        backend = mock.Mock()
+        backend.list_completions.return_value = [{
+            "id": "future", "title": "future", "completed_at": "2026-09-19T12:00:00Z",
+            "priority": 1, "source": "fake",
+        }]
+        cfg = {"backend": "fake", "timezone": "UTC", "xp": rewards.DEFAULT_XP}
+        state = base_state()
+        state["baseline_at"] = "2026-09-16T00:00:00Z"
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(rewards, "load_backend", return_value=backend), \
+             mock.patch.object(rewards, "local_today", return_value=date(2026, 9, 18)):
+            payload = rewards.cmd_poll(cfg, state, Path(tmp) / "ledger.json")
+        self.assertEqual(payload["batch"], [])
+        self.assertEqual(state["tasks_completed"], 0)
 
 
 class AchievementTests(unittest.TestCase):
@@ -203,6 +284,15 @@ class AchievementTests(unittest.TestCase):
         rewards.earned_achievements(state)
         rewards.earned_achievements(state)
         self.assertEqual(state, before)  # rendering never mutates or pays XP
+
+    def test_earned_view_is_derived_from_counters_not_paid_bonus_list(self):
+        state = base_state()
+        state["tasks_completed"] = 1
+        state["achievements"] = []
+        earned = {key: unlocked for key, _label, unlocked, _cur, _target
+                  in rewards.earned_achievements(state)}
+        self.assertTrue(earned["first_spark"])
+        self.assertEqual(state["achievements"], [])
 
     def test_category_ladders_are_generated_per_category(self):
         state = base_state()
@@ -231,6 +321,20 @@ class HighlightThrottleTests(unittest.TestCase):
             rewards.take_highlight(state, date(2026, 9, 18))
         self.assertFalse(rewards.take_highlight(state, date(2026, 9, 18)))
         self.assertTrue(rewards.take_highlight(state, date(2026, 9, 19)))
+
+
+class StatusRenderTests(unittest.TestCase):
+    def test_compact_status_is_two_useful_lines(self):
+        state = rewards.default_state("test")
+        state.update({"streak_days": 3, "freezes": 1, "tasks_completed": 4, "total_xp": 80})
+        payload = rewards.status_payload(state, "test", date(2026, 9, 18))
+
+        rendered = rewards.render_status(payload, compact=True)
+
+        self.assertEqual(len(rendered.splitlines()), 2)
+        self.assertIn("Level", rendered)
+        self.assertIn("3 day streak", rendered)
+        self.assertIn("4 tasks", rendered)
 
 
 class StoragedTests(unittest.TestCase):

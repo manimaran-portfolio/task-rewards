@@ -1,14 +1,19 @@
 ---
 name: task-rewards
 description: Award XP, levels, and streaks for completed tasks.
-version: 0.1.0
+version: 0.2.0
 author: Mani (manimaran-portfolio), Hermes Agent
 license: MIT
-platforms: [linux, macos, windows]
+platforms: [linux, macos]
 metadata:
   hermes:
     tags: [Gamification, Tasks, Todoist, Markdown, Motivation]
     related_skills: []
+required_environment_variables:
+  - name: TODOIST_API_TOKEN
+    prompt: Todoist API token (optional; skip for markdown or JSON)
+    help: Get it from Todoist Settings > Integrations > Developer.
+    required_for: Todoist backend only
 ---
 
 # Task Rewards Skill
@@ -18,7 +23,8 @@ replace it. Completed tasks pay XP, XP earns levels, days you finish something
 protect a streak, and five derived achievements mark the milestones.
 
 It is a plain stdlib Python engine plus swappable backends, so it works against
-Todoist or against any markdown checklist. Nothing leaves the machine.
+Todoist or against any markdown checklist. Reward state stays local; Todoist
+mode contacts only Todoist's API.
 
 ## When to Use
 
@@ -34,9 +40,8 @@ Todoist or against any markdown checklist. Nothing leaves the machine.
 - Python 3.9+ on PATH (stdlib only — no packages to install).
 - A task source:
   - **markdown** — a file or folder of checklists. No account needed.
-  - **todoist** — requires `TODOIST_API_TOKEN` in the environment. Read it from
-    `$HERMES_HOME/.env` (falling back to `~/.hermes/.env`); never write the
-    token into the config file.
+  - **todoist** — requires `TODOIST_API_TOKEN`, supplied through Hermes' secure
+    skill setup. Never write the token into the task-rewards config file.
   - **json** — a JSON array or NDJSON file of completion records.
 - Optional: a messaging platform configured in Hermes, for pushing rewards.
 
@@ -45,13 +50,19 @@ Todoist or against any markdown checklist. Nothing leaves the machine.
 Run `--setup --auto` once, right after this skill's files land in a profile's
 skills directory — it needs no arguments and no TTY:
 
+The runtime bundle consists of `scripts/rewards.py`, `scripts/wizard.py`,
+`scripts/profile_paths.py`, `scripts/backends/__init__.py`,
+`scripts/backends/todoist.py`, `scripts/backends/markdown.py`,
+`scripts/backends/json.py`, and `templates/config.example.json`. These explicit
+paths let Hermes' direct-URL installer fetch every required support file.
+
 ```
-terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --setup --auto")
+terminal(command="python3 ${HERMES_SKILL_DIR}/scripts/rewards.py --setup --auto")
 ```
 
 It cascades: an already-configured Todoist token wins (picks the "Inbox"
 project, or the first one, without asking which); otherwise it scans common
-checklist locations (`~/Documents`, `~/Obsidian`, `~/notes`, `~/.hermes`, ...)
+checklist locations (`~/Documents`, `~/Obsidian`, `~/notes`, ...)
 for a file that already contains real `- [ ]`/`- [x]`/todo.txt lines and
 adopts it; otherwise it creates a fresh blank checklist and uses that. Either
 way the install ends **active**, never stuck waiting on a question. All of
@@ -66,12 +77,13 @@ a good-enough default, not a promise that it read the user's mind.
 
 ## How to Run
 
-All commands go through `terminal`. `${SKILL_DIR}` is this skill's directory.
+All commands go through `terminal`. `${HERMES_SKILL_DIR}` is substituted with
+this skill's absolute directory by Hermes.
 
 ```
-terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --setup")
-terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --config ~/.hermes/task-rewards.json --poll")
-terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --config ~/.hermes/task-rewards.json --status")
+terminal(command="python3 ${HERMES_SKILL_DIR}/scripts/rewards.py --setup")
+terminal(command="python3 ${HERMES_SKILL_DIR}/scripts/rewards.py --config ~/.hermes/task-rewards.json --poll")
+terminal(command="python3 ${HERMES_SKILL_DIR}/scripts/rewards.py --config ~/.hermes/task-rewards.json --status")
 ```
 
 `--poll` is silent when nothing changed by design, so it is safe on a schedule.
@@ -85,9 +97,9 @@ dry-run that awards nothing. It works interactively on a TTY and
 non-interactively via flags, so you can drive it without prompting:
 
 ```
-terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --setup --yes")
-terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --setup --list-projects")
-terminal(command="python3 ${SKILL_DIR}/scripts/rewards.py --setup --yes --project-id <id> --scope health")
+terminal(command="python3 ${HERMES_SKILL_DIR}/scripts/rewards.py --setup --yes")
+terminal(command="python3 ${HERMES_SKILL_DIR}/scripts/rewards.py --setup --list-projects")
+terminal(command="python3 ${HERMES_SKILL_DIR}/scripts/rewards.py --setup --yes --project-id <id> --scope health")
 ```
 
 Flags: `--backend`, `--project-id`, `--path`, `--scope`, `--category`,
@@ -96,7 +108,7 @@ Flags: `--backend`, `--project-id`, `--path`, `--scope`, `--category`,
 
 **`--doctor` reports the environment and writes nothing.** Run it first when
 something fails — it answers the questions that actually go wrong:
-it finds the token and names the file it came from, checks the config and
+it checks whether the token is available, checks the config and
 ledger are reachable, verifies a live API call, and **detects when the skill is
 installed outside the active profile's skills directory** (the agent then
 cannot discover it, even though every file is present). Never prints the token.
@@ -137,7 +149,7 @@ The rule: **the script owns the numbers; you own the meaning.**
 | `--list-projects` | List Todoist projects with their ids |
 | `--poll` | Fetch completions, award XP, print a reward block (empty if none) |
 | `--status` | Level, streak, totals, achievement list |
-| `--status --compact` | Two lines only |
+| `--status --compact` | Two useful lines: level, then streak/freezes/totals |
 | `--streak-check` | Evening warning before a streak is lost (empty if safe) |
 | `--ledger` | Dump the raw ledger as JSON |
 | `--json` | Add to `--poll`/`--status`/`--streak-check` for structured output |
@@ -188,9 +200,11 @@ detection, validation, writing and baseline in one pass.
   level 50. Surplus rolls over. Reading this as a cumulative total makes levels
   arrive far too fast.
 - Streak: one calendar day with ≥1 completion. Every 7 continuous days banks a
-  **freeze** (max 2). A missed day consumes a freeze and preserves the streak;
-  with none banked the streak resets to 0. `longest_streak` is kept separately.
-- Achievements are derived from existing counters, never authored or stored.
+  **freeze** (max 2). Each missed day consumes one freeze; if the bank cannot
+  cover the full gap, the streak resets and freeze progress restarts.
+  `longest_streak` is kept separately.
+- Achievement earned state is derived from existing counters. The ledger stores
+  only which one-time bonuses were already paid.
   Base set: First Spark (1 task, +50), Getting Going (25, +30), Century Club
   (1000 XP, +200), Week One (7-day streak, +100), Unbroken (30-day, +300).
 - **Per-category ladders are generated, not authored**: for every category the
@@ -248,14 +262,9 @@ detection, validation, writing and baseline in one pass.
 - **Never unlock achievements while rendering.** Unlocking pays XP; if a display
   path could unlock, every `--status` would mint free levels. Keep the split
   between `check_achievements()` (writes) and `earned_achievements()` (reads).
-- **Credentials live in .env files, and there is more than one.** Profiles each
-  have their own `.env`. Never hardcode a single path — that is how a skill
-  works for its author and fails for everyone else. `find_token()` searches
-  `$HERMES_HOME/.env`, then `~/.hermes/.env`, then every `profiles/*/.env`, and
-  `--doctor` names the file it used. Never print the token, only its source.
-- **A cron run has no shell profile.** Anything that only reads the exported
-  environment works interactively and dies on schedule. Resolve credentials
-  from the filesystem, not just `os.environ`.
+- **Secrets are profile-isolated.** Obtain `TODOIST_API_TOKEN` through Hermes'
+  secure skill setup. The backend reads only the current process environment;
+  it never searches another profile or prints the token.
 - **Profiles are islands.** Installing this skill into the default profile does
   not make it visible to a named profile such as a health or finance bot — each
   has its own skills directory. Copy it into every profile that needs it, and

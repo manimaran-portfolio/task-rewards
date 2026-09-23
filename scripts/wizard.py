@@ -22,6 +22,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import profile_paths  # noqa: E402
@@ -34,7 +35,7 @@ DEFAULT_XP = {"4": 50, "3": 30, "2": 20, "1": 10}
 # gets adopted — a folder of prose notes must never become a "task list".
 COMMON_CHECKLIST_ROOTS = (
     "~/Documents", "~/Obsidian", "~/obsidian", "~/notes", "~/Notes",
-    "~/vault", "~/Vault", "~/.hermes",
+    "~/vault", "~/Vault",
 )
 MAX_AUTO_SCAN_FILES = 300
 
@@ -58,13 +59,13 @@ def _short(p) -> str:
 def detect_timezone() -> str:
     """Best-effort IANA zone. Never invents a wrong one — falls back to UTC."""
     tz = os.environ.get("TZ")
-    if tz and "/" in tz:
+    if tz and valid_timezone(tz):
         return tz
     etc = Path("/etc/timezone")
     if etc.is_file():
         try:
             val = etc.read_text(encoding="utf-8").strip()
-            if val and "/" in val:
+            if val and valid_timezone(val):
                 return val
         except OSError:
             pass
@@ -77,6 +78,15 @@ def detect_timezone() -> str:
         except OSError:
             pass
     return "UTC"
+
+
+def valid_timezone(name: str) -> bool:
+    """Whether an IANA timezone can be loaded on this Python installation."""
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        return False
+    return True
 
 
 def slugify(name: str) -> str:
@@ -142,9 +152,7 @@ def cmd_doctor(cfg_path: Path) -> int:
                            f"{type(exc).__name__}: {str(exc)[:70]}")
         else:
             out.append(f"  {_tick(False)} TODOIST_API_TOKEN  not found")
-            out.append("      searched:")
-            for p in todoist.env_candidates():
-                out.append(f"        - {_short(p)}")
+            out.append("      configure it through Hermes' secure skill setup")
     except Exception as exc:  # noqa: BLE001
         out.append(f"  {_tick(False)} backend import failed: {exc}")
 
@@ -161,11 +169,18 @@ def cmd_doctor(cfg_path: Path) -> int:
             for key in ("scope", "backend", "timezone", "active"):
                 if key in cfg:
                     out.append(f"      {key:<12}  {cfg[key]}")
+            tzname = cfg.get("timezone", "UTC")
+            out.append(f"  {_tick(valid_timezone(tzname))} timezone data   {tzname}")
             bo = cfg.get("backend_options") or {}
             if bo.get("project_id"):
                 out.append(f"      project_id    {bo['project_id']}")
             if bo.get("path"):
                 out.append(f"      path          {_short(bo['path'])}")
+                source_path = Path(os.path.expanduser(str(bo["path"])))
+                if cfg.get("backend") == "json":
+                    out.append(f"  {_tick(source_path.is_file())} JSON source is a regular file")
+                else:
+                    out.append(f"  {_tick(source_path.exists())} source path exists")
 
             # ledger
             out.append("")
@@ -240,7 +255,7 @@ def _scan_for_checklist() -> Path | None:
             except OSError:
                 continue
             if any(MD_CHECKBOX.match(line) or TODOTXT.match(line) for line in lines):
-                return p
+                return md
     return None
 
 
@@ -262,20 +277,22 @@ def _auto_detect(args) -> None:
     from backends import todoist  # noqa: E402
     token, _src = todoist.find_token()
     if token:
-        args.backend = "todoist"
-        if not getattr(args, "project_id", None):
-            try:
-                projects = todoist.list_projects()
-            except Exception:  # noqa: BLE001
-                projects = []
-            pick = next((p for p in projects
-                        if str(p.get("name", "")).strip().lower() == "inbox"), None)
-            pick = pick or (projects[0] if projects else None)
-            if pick:
-                args.project_id = pick.get("id")
-                if not getattr(args, "scope", None):
-                    args.scope = slugify(pick.get("name") or "tasks")
-        return
+        try:
+            projects = todoist.list_projects()
+        except Exception:  # an unusable token must not block the safe fallback
+            projects = None
+        if projects is not None:
+            if not getattr(args, "project_id", None):
+                pick = next((p for p in projects
+                            if str(p.get("name", "")).strip().lower() == "inbox"), None)
+                pick = pick or (projects[0] if projects else None)
+                if pick:
+                    args.project_id = pick.get("id")
+                    if not getattr(args, "scope", None):
+                        args.scope = slugify(pick.get("name") or "tasks")
+            if getattr(args, "project_id", None):
+                args.backend = "todoist"
+                return
 
     found = _scan_for_checklist()
     if found:
@@ -373,13 +390,8 @@ def cmd_setup(args) -> int:
     project_name = ""
     if backend == "todoist":
         if not token:
-            print(f"   {_tick(False)} TODOIST_API_TOKEN not found. Add it to one of:")
-            here = Path(__file__).resolve().parent
-            sys.path.insert(0, str(here))
-            from backends import todoist  # noqa: E402
-            for p in todoist.env_candidates():
-                print(f"       - {_short(p)}")
-            print("   Then re-run --setup.")
+            print(f"   {_tick(False)} TODOIST_API_TOKEN not found.")
+            print("   Configure it through Hermes' secure skill setup, then re-run --setup.")
             return 2
         where = _short(src) if src else "the environment"
         print(f"   {_tick(True)} Todoist token found in {where}")
@@ -428,13 +440,13 @@ def cmd_setup(args) -> int:
         if project_name:
             print(f"   selected: {project_name}  ({project_id})")
 
-    else:  # markdown
+    elif backend in {"markdown", "json"}:
         target = getattr(args, "path", None)
         if not target:
             target = _prompt("   path to a checklist file or folder",
                              assume_yes=assume_yes)
         if not target:
-            print("   markdown needs --path <file-or-folder>")
+            print(f"   {backend} needs --path <file-or-folder>")
             return 2
         target = os.path.expanduser(target)
         p = Path(target)
@@ -443,13 +455,22 @@ def cmd_setup(args) -> int:
             return 2
         kind = "directory" if p.is_dir() else "file"
         print(f"   {_tick(True)} path exists ({kind})")
-        if p.is_dir():
+        if backend == "json":
+            from backends import json as _json_backend  # noqa: E402
+            error = _json_backend.validate_file(p)
+            if error:
+                print(f"   {_tick(False)} {error}")
+                return 2
+        elif p.is_dir():
             n = len(list(p.rglob("*.md")))
             print(f"      {n} markdown file(s) under it")
             if n == 0:
                 print("   no .md files found there \u2014 check the path")
                 return 2
         backend_options["path"] = target
+    else:
+        print(f"   {_tick(False)} unsupported backend: {backend}")
+        return 2
 
     print()
 
@@ -477,6 +498,9 @@ def cmd_setup(args) -> int:
     if not tzname:
         detected = detect_timezone()
         tzname = _prompt("   timezone (IANA)", detected, assume_yes=assume_yes) or detected
+    if not valid_timezone(tzname):
+        print(f"   {_tick(False)} unknown timezone: {tzname}")
+        return 2
     print(f"   {_tick(True)} timezone: {tzname}")
     print()
 

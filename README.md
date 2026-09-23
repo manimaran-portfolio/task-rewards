@@ -10,8 +10,9 @@ It does not replace your task manager. It reads it.
   output, no LLM in the loop, zero tokens per check.
 - **Idempotent** — polling twice never double-awards.
 - **Cron-safe** — silent when nothing happened.
-- **Local** — one JSON ledger on your disk. Nothing leaves the machine.
-- **Backends** — Todoist, or any markdown checklist.
+- **Local state** — the reward ledger stays on your disk. Todoist mode contacts
+  only Todoist's API.
+- **Backends** — Todoist, markdown checklists, or JSON/NDJSON exports.
 
 ## Why not an LLM-mediated tracker
 
@@ -32,10 +33,21 @@ The script owns the numbers; the agent owns the meaning.
 
 ## Install
 
-As a Hermes Agent skill, drop this directory into your skills folder:
+Install directly from GitHub with Hermes:
 
 ```bash
-git clone <this-repo> ~/.hermes/skills/productivity/task-rewards
+hermes skills install \
+  https://raw.githubusercontent.com/manimaran-portfolio/task-rewards/main/SKILL.md \
+  --category productivity
+python3 ~/.hermes/skills/productivity/task-rewards/scripts/rewards.py --setup --auto
+```
+
+Or clone it manually:
+
+```bash
+git clone https://github.com/manimaran-portfolio/task-rewards.git \
+  ~/.hermes/skills/productivity/task-rewards
+cd ~/.hermes/skills/productivity/task-rewards
 ```
 
 Requires Python 3.9+. There are no dependencies — standard library only.
@@ -50,8 +62,9 @@ python3 scripts/rewards.py --setup
 python3 scripts/rewards.py --config ~/.hermes/task-rewards.json --status
 ```
 
-`--setup` is the entry point. It finds your Todoist token and lists your real
-projects, or takes a markdown file or folder, then writes the config and
+`--setup` is the entry point. It uses `TODOIST_API_TOKEN` from the current
+process environment and lists your real Todoist projects, or takes a markdown
+file or folder, then writes the config and
 establishes a baseline that awards nothing — so years of history never flood in.
 
 It runs interactively on a TTY, or non-interactively when an agent drives it:
@@ -65,7 +78,7 @@ python3 scripts/rewards.py --setup --yes --project-id <id> --scope health
 install hook should call right after dropping this skill into a profile.
 No prompts, no flags to fill in: Todoist if a token is already configured
 (picking the "Inbox" project, or the first one, without asking) → else the
-first existing checklist found under a common notes location → else a fresh
+first existing checklist file found under a common notes location → else a fresh
 blank checklist created for you. It always ends with something active.
 
 ```bash
@@ -96,6 +109,10 @@ minutes and forget about it.
 | `--ledger` | Dump the raw ledger as JSON |
 | `--json` | Machine-readable output for `--poll`/`--status`/`--streak-check`, for driving this from any bot |
 
+`--notify digest` and `--notify instant` are compatibility aliases for enabled
+poll output; the scheduler determines whether delivery is immediate or batched.
+Use `--notify off` to suppress poll output while continuing to update rewards.
+
 Flags combine: `--poll --status` runs the poll quietly and prints the
 resulting status in one call — handy for a bot that wants "sync, then tell
 me where things stand" without two round trips. Add `--json` to get one
@@ -104,11 +121,13 @@ flat; combining flags nests each under its own key).
 
 ## Profiles
 
-Every default path — the config, the ledger, and the Todoist `.env` lookup —
-resolves under `$HERMES_HOME` when it's set, falling back to `~/.hermes`.
+Every default path — including the config and ledger — resolves under
+`$HERMES_HOME` when set, falling back to `~/.hermes`.
 Installing this skill into a second Hermes profile (a health bot, a finance
 bot, ...) just works without passing `--config`/`--ledger-path` by hand, the
-same way the token lookup already worked per-profile.
+same way as other profile-local state. Todoist credentials are intentionally
+not searched across profiles: inject `TODOIST_API_TOKEN` into each profile that
+uses Todoist.
 
 ## Backends
 
@@ -163,10 +182,11 @@ than allowed to corrupt the ledger.
   per task.
 - **Levels** — advancing *from* level L costs `round(100 × L^1.5)` XP, capped at
   50. Surplus rolls over.
-- **Streak** — one calendar day with ≥1 completion. Every 7 continuous days
-  banks a freeze (max 2). A missed day consumes a freeze; with none banked the
-  streak resets.
-- **Achievements** — derived from counters, never stored by hand. Base set plus
+- **Streak** — one local calendar day with ≥1 completion. Every 7 continuous
+  days banks a freeze (max 2). Each missed day consumes one freeze; if the bank
+  cannot cover the full gap, the streak resets and freeze progress restarts.
+- **Achievements** — earned state is derived from counters. The ledger stores
+  only which one-time bonuses were already paid. The base set plus
   a per-category ladder (`Apprentice` 10, `Master` 20, `Expert` 50) generated
   for every category the ledger has seen.
 - **Highlight throttle** — at most 2 emphasised messages per day, priority
@@ -201,6 +221,23 @@ install. Covers the scoring engine, all three backends (including a
 subprocess-level `--setup --auto` install simulation), and the ledger
 lock/dedupe correctness that only shows up under concurrent or long-running
 use.
+
+## Compatibility
+
+| Platform | Support |
+|---|---|
+| Linux | Supported; exercised by the full suite and CI |
+| macOS | Supported; covered by CI |
+| Windows | Not currently advertised: Python's stdlib does not ship IANA timezone data there |
+
+The CI matrix covers Python 3.9 through 3.13. The project intentionally has no
+runtime or test dependencies outside the standard library.
+
+## Support
+
+Report bugs and installation problems at
+https://github.com/manimaran-portfolio/task-rewards/issues. Include `--doctor`
+output, but never include `TODOIST_API_TOKEN` or other credentials.
 
 ## License
 

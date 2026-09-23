@@ -11,70 +11,21 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import profile_paths  # noqa: E402
 
 SOURCE = "todoist"
 API = "https://api.todoist.com/api/v1"
 MAX_LOOKBACK_DAYS = 7
 
 
-def env_candidates() -> list[Path]:
-    """Every .env worth searching, most-specific first.
-
-    A skill can be installed into any profile, and each profile has its own
-    .env. Hardcoding one path is what makes a skill work for its author and
-    fail for everyone else.
-    """
-    out: list[Path] = [profile_paths.hermes_home() / ".env"]
-    out.append(Path.home() / ".hermes" / ".env")
-    profiles = Path.home() / ".hermes" / "profiles"
-    if profiles.is_dir():
-        out.extend(sorted(profiles.glob("*/.env")))
-    seen, uniq = set(), []
-    for p in out:
-        if str(p) not in seen:
-            seen.add(str(p))
-            uniq.append(p)
-    return uniq
-
-
-def _read_env_value(path: Path, key: str) -> str | None:
-    if not path.is_file():
-        return None
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return None
-    for line in lines:
-        line = line.strip()
-        if line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        if k.strip() == key:
-            v = v.strip().strip('"').strip("'")
-            if v:
-                return v
-    return None
-
-
-def find_token() -> tuple[str | None, Path | None]:
-    """Return (token, source_file). source_file is None when it came from the
-    environment, so callers can report *where* it was found without ever
-    printing the value itself."""
+def find_token() -> tuple[str | None, None]:
+    """Return the token supplied by Hermes' secret environment passthrough."""
     tok = os.environ.get("TODOIST_API_TOKEN")
     if tok:
         return tok, None
-    for path in env_candidates():
-        value = _read_env_value(path, "TODOIST_API_TOKEN")
-        if value:
-            return value, path
     return None, None
 
 
@@ -83,10 +34,9 @@ def _token() -> str:
     tok, _src = find_token()
     if tok:
         return tok
-    looked = "\n".join(f"  - {p}" for p in env_candidates())
     raise RuntimeError(
-        "TODOIST_API_TOKEN not found. Set it in the environment, or add it to "
-        "one of these .env files:\n" + looked
+        "TODOIST_API_TOKEN not found. Configure it through Hermes' secure "
+        "skill setup or export it for this process."
     )
 
 
@@ -98,12 +48,37 @@ def _get(url: str, token: str) -> dict:
         return json.load(resp)
 
 
+def _paged_items(url: str, token: str, *keys: str) -> list[dict]:
+    """Return every cursor page from a Todoist collection endpoint."""
+    out = []
+    cursor = None
+    while True:
+        page_url = url
+        if cursor:
+            separator = "&" if "?" in page_url else "?"
+            page_url += separator + "cursor=" + urllib.parse.quote(str(cursor), safe="")
+        payload = _get(page_url, token)
+        if isinstance(payload, list):
+            out.extend(item for item in payload if isinstance(item, dict))
+            break
+        if not isinstance(payload, dict):
+            break
+        items = []
+        for key in keys:
+            candidate = payload.get(key)
+            if isinstance(candidate, list):
+                items = candidate
+                break
+        out.extend(item for item in items if isinstance(item, dict))
+        cursor = payload.get("next_cursor")
+        if not cursor:
+            break
+    return out
+
+
 def list_projects() -> list[dict]:
     """Live project list, for the setup wizard."""
-    payload = _get(f"{API}/projects", _token())
-    items = payload
-    if isinstance(payload, dict):
-        items = payload.get("results") or payload.get("items") or []
+    items = _paged_items(f"{API}/projects?limit=200", _token(), "results", "items")
     return sorted(items, key=lambda p: str(p.get("name", "")).lower())
 
 
@@ -131,13 +106,16 @@ def list_completions(since_iso: str, cfg: dict) -> list[dict]:
         f"&until={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}"
         f"&limit=200"
     )
-    payload = _get(url, token)
+    if project_id:
+        url += "&project_id=" + urllib.parse.quote(project_id, safe="")
+    completed_items = _paged_items(url, token, "items", "results")
 
     now = datetime.now(timezone.utc)
     hold = []  # seed with the completion's own timestamp when we have one
-    for item in payload.get("items", []):
-        if project_id and str(item.get("project_id")) != project_id:
-            continue  # ownership: only this scope's project belongs to this ledger
+    for item in completed_items:
+        if project_id and item.get("project_id") is not None \
+                and str(item.get("project_id")) != project_id:
+            continue  # defend against an API response that ignored the filter
         hold.append({
             "id": str(item.get("id")),
             "title": (item.get("content") or "task")[:80],
@@ -157,8 +135,10 @@ def list_completions(since_iso: str, cfg: dict) -> list[dict]:
     # is what matters, and recurring tasks reset immediately after a check,
     # so completed_count>0 today maps to one today-winning occurrence.
     if project_id:
-        tasks_url = f"{API}/tasks?project_id={project_id}&limit=200"
-        tasks = (_get(tasks_url, token) or {}).get("results", [])
+        tasks_url = (
+            f"{API}/tasks?project_id={urllib.parse.quote(project_id, safe='')}&limit=200"
+        )
+        tasks = _paged_items(tasks_url, token, "results", "items")
         for t in tasks:
             completed_count = t.get("completed_count") or 0
             if completed_count <= 0:

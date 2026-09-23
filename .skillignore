@@ -1,0 +1,9 @@
+# Development and repository-only files are not part of the runtime skill bundle.
+.git/
+.github/
+__pycache__/
+*.pyc
+CLAUDE.md
+README.md
+CHANGELOG.md
+tests/

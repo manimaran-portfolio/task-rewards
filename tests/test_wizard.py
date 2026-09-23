@@ -39,6 +39,12 @@ class DetectTimezoneTests(unittest.TestCase):
                  mock.patch.object(wizard.Path, "is_symlink", return_value=False):
                 self.assertEqual(wizard.detect_timezone(), "UTC")
 
+    def test_rejects_an_unknown_explicit_timezone(self):
+        self.assertFalse(wizard.valid_timezone("Mars/Olympus_Mons"))
+
+    def test_accepts_utc(self):
+        self.assertTrue(wizard.valid_timezone("UTC"))
+
 
 class ScanForChecklistTests(unittest.TestCase):
     def test_finds_a_directory_with_a_real_checkbox(self):
@@ -48,7 +54,10 @@ class ScanForChecklistTests(unittest.TestCase):
             (vault / "log.md").write_text("- [x] Done thing\n", encoding="utf-8")
             with mock.patch.object(wizard, "COMMON_CHECKLIST_ROOTS", (str(vault.parent),)):
                 found = wizard._scan_for_checklist()
-            self.assertEqual(found, vault.parent)
+            self.assertEqual(found, vault / "log.md")
+
+    def test_auto_scan_does_not_search_hermes_internal_files(self):
+        self.assertNotIn("~/.hermes", wizard.COMMON_CHECKLIST_ROOTS)
 
     def test_prose_only_notes_are_not_adopted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -72,8 +81,19 @@ class AutoDetectTests(unittest.TestCase):
              mock.patch("backends.todoist.list_projects", return_value=fake_projects):
             wizard._auto_detect(args)
         self.assertEqual(args.backend, "todoist")
-        self.assertEqual(args.project_id, "1")  # picked "Inbox" specifically
+        self.assertEqual(args.project_id, "1")
         self.assertEqual(args.scope, "inbox")
+
+    def test_invalid_todoist_token_falls_back_to_checklist(self):
+        args = mock.Mock(backend=None, project_id=None, scope=None, path=None, yes=False)
+        checklist = Path("/tmp/tasks.md")
+        with mock.patch("backends.todoist.find_token", return_value=("bad-token", None)), \
+             mock.patch("backends.todoist.list_projects", side_effect=RuntimeError("401")), \
+             mock.patch.object(wizard, "_scan_for_checklist", return_value=checklist):
+            wizard._auto_detect(args)
+        self.assertEqual(args.backend, "markdown")
+        self.assertEqual(args.path, str(checklist))
+        self.assertEqual(args.scope, "tasksmd")
 
     def test_picks_first_project_when_no_inbox_exists(self):
         args = mock.Mock(backend=None, project_id=None, scope=None)
@@ -93,7 +113,7 @@ class AutoDetectTests(unittest.TestCase):
                  mock.patch.object(wizard, "COMMON_CHECKLIST_ROOTS", (str(vault.parent),)):
                 wizard._auto_detect(args)
             self.assertEqual(args.backend, "markdown")
-            self.assertEqual(args.path, str(vault.parent))
+            self.assertEqual(args.path, str(vault / "log.md"))
 
     def test_creates_a_blank_checklist_as_last_resort(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -150,7 +170,24 @@ class SetupAutoSubprocessTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
             self.assertEqual(cfg["backend"], "markdown")
-            self.assertEqual(cfg["backend_options"]["path"], str(vault))
+            self.assertEqual(cfg["backend_options"]["path"], str(vault / "log.md"))
+
+    def test_json_setup_rejects_malformed_input_before_writing_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            source = home / "bad.ndjson"
+            source.write_text('{"id":"1"}\nnot json\n', encoding="utf-8")
+            cfg_path = home / ".hermes" / "task-rewards.json"
+            env = {"PATH": "/usr/bin:/bin", "HOME": str(home),
+                   "HERMES_HOME": str(home / ".hermes")}
+            r = subprocess.run([
+                sys.executable, str(REWARDS_PY), "--setup", "--yes",
+                "--backend", "json", "--path", str(source), "--scope", "test",
+                "--timezone", "UTC", "--config", str(cfg_path),
+            ], capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertFalse(cfg_path.exists())
+            self.assertIn("line 2", r.stdout)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ VERSION = 1
 DEFAULT_XP = {"4": 50, "3": 30, "2": 20, "1": 10}
 FREEZE_EVERY = 7
 FREEZE_CAP = 2
-SEEN_CAP = 500  # bound the dedupe set; history is truncated on free tiers anyway
+SEEN_CAP = 500  # soft target; never evict keys a backend can still return
 MAX_LEVEL = 50  # hard cap: keeps the late-game requirement from growing unbounded
 STREAK_BONUS = 10  # flat, once per day — deliberately NOT a per-task multiplier
 HIGHLIGHT_CAP = 2  # max emphasised messages per day, per the throttle below
@@ -133,6 +133,19 @@ def local_today(tzname: str) -> date:
         return datetime.now().date()
 
 
+def completion_date(rec: dict, tzname: str = "UTC") -> date:
+    """Return a completion timestamp's calendar date in the configured zone."""
+    stamp = str(rec.get("completed_at") or "")
+    dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.astimezone(ZoneInfo(tzname)).date()
+    except Exception:
+        return dt.astimezone(timezone.utc).date()
+
+
 # --------------------------------------------------------------------------
 # mechanics
 # --------------------------------------------------------------------------
@@ -184,15 +197,15 @@ def normalize_record(rec) -> dict | None:
     }
 
 
-def dedupe_key(rec: dict) -> str:
+def dedupe_key(rec: dict, tzname: str = "UTC") -> str:
     """task identity at day granularity.
 
     Keying on the raw timestamp would re-award when a user unchecks and
     rechecks a task (Todoist issues a fresh completed_at). Day granularity
     absorbs that, and lets a recurring task legitimately pay once per day.
     """
-    stamp = str(rec.get("completed_at") or "")[:10]
-    basis = f"{rec.get('source','')}:{rec.get('id','')}:{stamp}"
+    day = completion_date(rec, tzname).isoformat()
+    basis = f"{rec.get('source','')}:{rec.get('id','')}:{day}"
     return hashlib.sha256(basis.encode()).hexdigest()[:16]
 
 
@@ -220,29 +233,43 @@ def apply_completion(state: dict, xp: int, today: date,
 
     # streak first, so the daily bonus below sees the updated value
     last = state.get("last_active_date")
+    late = False
     if last == today_iso:
         pass
-    elif last == (today - timedelta(days=1)).isoformat() or last is None:
+    elif last is None:
         state["streak_days"] = state.get("streak_days", 0) + 1
         state["freeze_progress"] = state.get("freeze_progress", 0) + 1
-        if state["freeze_progress"] >= FREEZE_EVERY:
+    else:
+        last_date = date.fromisoformat(last)
+        gap = (today - last_date).days
+        if gap < 0:
+            late = True
+        elif gap == 1:
+            state["streak_days"] = state.get("streak_days", 0) + 1
+            state["freeze_progress"] = state.get("freeze_progress", 0) + 1
+        else:
+            missed_days = max(0, gap - 1)
+            freezes = state.get("freezes", 0)
+            if missed_days <= freezes:
+                state["freezes"] = freezes - missed_days
+                state["streak_days"] = state.get("streak_days", 0) + 1
+                state["freeze_progress"] = state.get("freeze_progress", 0) + 1
+            else:
+                state["freezes"] = 0
+                state["streak_days"] = 1
+                state["freeze_progress"] = 1
+    if not late:
+        if state.get("freeze_progress", 0) >= FREEZE_EVERY:
             state["freezes"] = min(FREEZE_CAP, state.get("freezes", 0) + 1)
             state["freeze_progress"] = 0
-    else:
-        # gap: consume a freeze if banked, else reset
-        if state.get("freezes", 0) > 0:
-            state["freezes"] -= 1
-            state["streak_days"] = state.get("streak_days", 0) + 1
-        else:
-            state["streak_days"] = 1
-    state["last_active_date"] = today_iso
-    state["longest_streak"] = max(state.get("longest_streak", 0), state["streak_days"])
+        state["last_active_date"] = today_iso
+        state["longest_streak"] = max(state.get("longest_streak", 0), state["streak_days"])
 
     # Flat once-per-day streak bonus, paid on the first completion of the day.
     # Deliberately NOT a per-task multiplier: at x2, clearing 15 trivial
     # subtasks would bank 30 tasks' worth of XP for one day of consistency.
     bonus = 0
-    if state.get("streak_bonus_date") != today_iso:
+    if not late and state.get("streak_bonus_date") != today_iso:
         tier = 1 + (1 if state["streak_days"] >= 10 else 0) \
                  + (1 if state["streak_days"] >= 30 else 0)
         bonus = STREAK_BONUS * tier
@@ -286,7 +313,8 @@ def effective_streak(state: dict, today: date) -> tuple[int, bool]:
     gap = (today - last_d).days
     if gap <= 1:
         return streak, False
-    if state.get("freezes", 0) > 0:
+    missed_days = gap - 1
+    if state.get("freezes", 0) >= missed_days:
         return streak, True  # a freeze covers exactly this one gap, not consumed until it's real
     # Framed as a beginning, never a loss, once the caller surfaces this: punishment
     # framing is what makes people quit a streak system outright.
@@ -330,10 +358,9 @@ def earned_achievements(state: dict) -> list[tuple[str, str, bool, int, int]]:
     Unlocking is NOT a side effect of rendering: an achievement must only ever
     be granted by check_achievements, or the bonus could be paid twice.
     """
-    have = set(state.get("achievements", []))
     out = []
-    for key, label, _pred, target, _bonus in all_achievements(state):
-        out.append((key, label, key in have, _progress(state, key, target), target))
+    for key, label, pred, target, _bonus in all_achievements(state):
+        out.append((key, label, pred(state), _progress(state, key, target), target))
     return out
 
 
@@ -441,7 +468,12 @@ def render_status(payload: dict, compact: bool = False) -> str:
         f"📊 {payload['tasks_completed']} tasks · {payload['total_xp']} XP lifetime",
     ]
     if compact:
-        return "\n".join(head[:3])
+        summary = (
+            f"🔥 {payload['streak_days']} day streak · "
+            f"🛡️ {payload['freezes']} freeze banked · "
+            f"📊 {payload['tasks_completed']} tasks · {payload['total_xp']} XP lifetime"
+        )
+        return "\n".join((level_line, summary))
     head += ["", f"Achievements   {payload['achievements_unlocked']} / {payload['achievements_total']}"]
     for a in payload["achievements"]:
         if a["unlocked"]:
@@ -488,6 +520,7 @@ def default_state(scope: str) -> dict:
         "daily_highlights": 0,
         "highlight_date": None,
         "processed": [],
+        "processed_dates": {},
         "last_poll": None,
     }
 
@@ -503,6 +536,48 @@ def _strip_transient(state: dict) -> None:
         del state[key]
 
 
+def _prune_processed(state: dict, backend_name: str, today: date, since) -> None:
+    """Shrink old dedupe keys without evicting the backend's overlap window.
+
+    A high-volume day may temporarily exceed SEEN_CAP. Correctness wins over a
+    hard cap: keys are removable only after shipped backends can no longer
+    return those records. Every shipped backend filters by the ``since``
+    watermark this poll passed (Todoist server-side; markdown/json client-side,
+    the latter with a one-day grace), so the safe cutoff is derived from
+    ``since`` itself — NOT from a fixed keep-days window, which would evict
+    keys for records a long-gap poll can still return (user offline a week,
+    then exceeding SEEN_CAP: a fixed cutoff would re-award days 3+)."""
+    keys = list(state.get("processed", []))
+    if len(keys) <= SEEN_CAP or backend_name not in {"todoist", "markdown", "json"}:
+        return
+    cutoff = None
+    if since:
+        try:
+            # Records returned by this poll completed on or after since's
+            # calendar day (markdown) or the day before it (json grace) —
+            # prune strictly before that, for every backend.
+            cutoff = datetime.fromisoformat(str(since).replace("Z", "+00:00")).date()
+        except ValueError:
+            cutoff = None
+    if cutoff is None:
+        return
+    cutoff -= timedelta(days=1)
+    dates = state.setdefault("processed_dates", {})
+    removable = {
+        key for key in keys
+        if dates.get(key) and date.fromisoformat(dates[key]) < cutoff
+    }
+    remove_count = min(len(removable), len(keys) - SEEN_CAP)
+    kept = []
+    for key in keys:
+        if remove_count and key in removable:
+            dates.pop(key, None)
+            remove_count -= 1
+            continue
+        kept.append(key)
+    state["processed"] = kept
+
+
 def cmd_poll(cfg: dict, state: dict, ledger_path: Path) -> dict:
     """Fetch completions, award XP, persist. Never prints — returns a payload
     dict so the caller (text renderer, --json, or a future non-CLI embedder)
@@ -511,7 +586,8 @@ def cmd_poll(cfg: dict, state: dict, ledger_path: Path) -> dict:
         return {"active": False, "baseline": False, "batch": []}  # paused: no awards, no state churn
 
     backend = load_backend(cfg["backend"])
-    today = local_today(cfg.get("timezone", "UTC"))
+    tzname = cfg.get("timezone", "UTC")
+    today = local_today(tzname)
 
     since = state.get("baseline_at")
     if not since:
@@ -520,32 +596,44 @@ def cmd_poll(cfg: dict, state: dict, ledger_path: Path) -> dict:
         # rather than silently ignoring it or silently awarding it.
         existing = [normalize_record(r) for r in backend.list_completions("", cfg)]
         existing = [r for r in existing if r is not None]
-        state["processed"] = [dedupe_key(r) for r in existing][-SEEN_CAP:]
+        state["processed"] = [dedupe_key(r, tzname) for r in existing]
+        state["processed_dates"] = {
+            dedupe_key(r, tzname): completion_date(r, tzname).isoformat()
+            for r in existing
+        }
         state["baseline_at"] = now_utc().isoformat()
         state["last_poll"] = now_utc().isoformat()
         atomic_write_json(ledger_path, state)
         return {"active": True, "baseline": True, "baseline_count": len(existing), "batch": []}
 
-    records = backend.list_completions(since, cfg)
+    records = [normalize_record(raw) for raw in backend.list_completions(since, cfg)]
+    dated_records = []
+    for rec in records:
+        if rec is None:
+            continue
+        completed_on = completion_date(rec, tzname)
+        if completed_on > today:
+            continue
+        dated_records.append((completed_on, rec))
+    dated_records.sort(key=lambda pair: (pair[0], pair[1]["completed_at"], pair[1]["id"]))
     # An ordered list, not just a set: SEEN_CAP truncation below must evict the
     # OLDEST keys. A set has no reliable iteration order, so capping straight
     # off `set(...)` could evict a key added this very poll and re-admit an
     # ancient one — silently letting a task double-pay once it cycles back in.
     seen_list = list(state.get("processed", []))
     seen_set = set(seen_list)
+    processed_dates = state.setdefault("processed_dates", {})
     batch = []
     leveled: list[int] = []
-    for raw in records:
-        rec = normalize_record(raw)
-        if rec is None:
-            continue  # malformed backend output must never reach the scoring path
-        key = dedupe_key(rec)
+    for completed_on, rec in dated_records:
+        key = dedupe_key(rec, tzname)
         if key in seen_set:
             continue
         seen_set.add(key)
         seen_list.append(key)
+        processed_dates[key] = completed_on.isoformat()
         xp = score(rec, cfg.get("xp", DEFAULT_XP))
-        apply_completion(state, xp, today, rec["category"])
+        apply_completion(state, xp, completed_on, rec["category"])
         # apply_completion reports level-ups from THIS completion only; collect
         # them here rather than letting a later completion in the same batch
         # overwrite them, or a level-up from completion #1 of 5 vanishes.
@@ -555,7 +643,8 @@ def cmd_poll(cfg: dict, state: dict, ledger_path: Path) -> dict:
     newly = []
     emphasis: list[str] = []
     if batch:
-        state["processed"] = seen_list[-SEEN_CAP:]
+        state["processed"] = seen_list
+        _prune_processed(state, cfg["backend"], today, since)
         # Achievement bonuses can themselves roll into a level, so run the
         # level pass again and append anything it produced.
         newly = check_achievements(state)
@@ -614,6 +703,25 @@ def cmd_streak_check(cfg: dict, state: dict) -> dict:
     else:
         warning = f"⚠️ No completions today — your {streak_days}-day streak ends at midnight."
     return {"active": True, "warning": warning, "streak_days": streak_days, "freezes": freezes}
+
+
+def validate_config(cfg: dict) -> list[str]:
+    """Return actionable config errors instead of allowing later KeyErrors."""
+    errors = []
+    if not cfg.get("ledger"):
+        errors.append("missing ledger path")
+    backend = cfg.get("backend")
+    if backend not in {"todoist", "markdown", "json"}:
+        errors.append(f"unsupported backend: {backend!r}")
+    if not isinstance(cfg.get("backend_options"), dict):
+        errors.append("backend_options must be an object")
+    tzname = cfg.get("timezone", "UTC")
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(tzname)
+    except (KeyError, TypeError, ValueError):
+        errors.append(f"invalid timezone: {tzname!r}")
+    return errors
 
 
 def main(argv=None) -> int:
@@ -695,6 +803,14 @@ def main(argv=None) -> int:
         print(f"  or run:  python3 {me} --setup", file=sys.stderr)
         return 2
 
+    config_errors = validate_config(cfg)
+    if config_errors:
+        print(f"task-rewards: invalid config at {cfg_path}", file=sys.stderr)
+        for error in config_errors:
+            print(f"  - {error}", file=sys.stderr)
+        print("  re-run --setup --force to repair it", file=sys.stderr)
+        return 2
+
     if not (args.ledger or args.status or args.streak_check or args.poll):
         ap.print_help()
         return 1
@@ -712,6 +828,11 @@ def main(argv=None) -> int:
             # must not let the second one act on a stale in-memory copy and
             # clobber the first one's write when it releases the lock.
             state = load_json(ledger_path, default_state(scope))
+            recovered_from = state.pop("_recovered_from", None)
+            recovery_warning = None
+            if recovered_from:
+                recovery_warning = f"Recovered from corrupt ledger; backup: {recovered_from}"
+                print(f"task-rewards: {recovery_warning}", file=sys.stderr)
 
             if args.ledger:
                 print(json.dumps(state, indent=2, sort_keys=True))
@@ -725,6 +846,9 @@ def main(argv=None) -> int:
                 results["status"] = status_payload(state, scope, today)
             if args.streak_check:
                 results["streak_check"] = cmd_streak_check(cfg, state)
+            if recovery_warning:
+                for payload in results.values():
+                    payload["recovery_warning"] = recovery_warning
 
             if args.json:
                 out = next(iter(results.values())) if len(results) == 1 else results

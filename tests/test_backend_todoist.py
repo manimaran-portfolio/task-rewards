@@ -19,24 +19,6 @@ class FakeResponse(io.BytesIO):
         return False
 
 
-class EnvCandidatesTests(unittest.TestCase):
-    def test_hermes_home_env_var_is_searched_first(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.dict(os.environ, {"HERMES_HOME": tmp}, clear=False):
-                candidates = todoist.env_candidates()
-                self.assertEqual(candidates[0], Path(tmp) / ".env")
-
-    def test_profile_env_files_are_included(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            (home / ".hermes" / "profiles" / "health").mkdir(parents=True)
-            (home / ".hermes" / "profiles" / "health" / ".env").write_text("X=1", encoding="utf-8")
-            with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
-                os.environ.pop("HERMES_HOME", None)
-                candidates = [str(p) for p in todoist.env_candidates()]
-                self.assertTrue(any("profiles/health/.env" in c for c in candidates))
-
-
 class FindTokenTests(unittest.TestCase):
     def test_environment_variable_wins_over_files(self):
         with mock.patch.dict(os.environ, {"TODOIST_API_TOKEN": "env-token"}, clear=False):
@@ -44,15 +26,15 @@ class FindTokenTests(unittest.TestCase):
             self.assertEqual(token, "env-token")
             self.assertIsNone(src)
 
-    def test_falls_back_to_env_file(self):
+    def test_does_not_read_tokens_from_profile_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             envfile = Path(tmp) / ".env"
             envfile.write_text('TODOIST_API_TOKEN="file-token"\n', encoding="utf-8")
             with mock.patch.dict(os.environ, {"HERMES_HOME": tmp}, clear=False):
                 os.environ.pop("TODOIST_API_TOKEN", None)
                 token, src = todoist.find_token()
-                self.assertEqual(token, "file-token")
-                self.assertEqual(src, envfile)
+                self.assertIsNone(token)
+                self.assertIsNone(src)
 
     def test_no_token_anywhere_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,6 +134,44 @@ class ListCompletionsTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as ctx:
                     todoist.list_completions("", {"backend_options": {}})
                 self.assertIn("TODOIST_API_TOKEN", str(ctx.exception))
+
+    def test_completed_stream_follows_cursor_and_filters_on_server(self):
+        pages = [
+            {"items": [{"id": 1, "project_id": "P1", "content": "A",
+                        "completed_at": "2026-09-18T08:00:00Z"}],
+             "next_cursor": "page-2"},
+            {"items": [{"id": 2, "project_id": "P1", "content": "B",
+                        "completed_at": "2026-09-18T09:00:00Z"}],
+             "next_cursor": None},
+        ]
+        urls = []
+
+        def fake_get(url, token):
+            urls.append(url)
+            if "/tasks?" in url:
+                return {"results": [], "next_cursor": None}
+            return pages.pop(0)
+
+        cfg = {"backend_options": {"project_id": "P1"}}
+        with mock.patch.dict(os.environ, {"TODOIST_API_TOKEN": "tok"}, clear=False), \
+             mock.patch.object(todoist, "_get", side_effect=fake_get):
+            out = todoist.list_completions("2026-09-17T00:00:00Z", cfg)
+        self.assertEqual({r["id"] for r in out}, {"1", "2"})
+        self.assertIn("project_id=P1", urls[0])
+        self.assertIn("cursor=page-2", urls[1])
+
+
+class ListProjectsTests(unittest.TestCase):
+    def test_list_projects_follows_cursor(self):
+        pages = [
+            {"results": [{"id": "1", "name": "Zed"}], "next_cursor": "next"},
+            {"results": [{"id": "2", "name": "Alpha"}], "next_cursor": None},
+        ]
+        with mock.patch.dict(os.environ, {"TODOIST_API_TOKEN": "tok"}, clear=False), \
+             mock.patch.object(todoist, "_get", side_effect=pages) as get:
+            projects = todoist.list_projects()
+        self.assertEqual([p["name"] for p in projects], ["Alpha", "Zed"])
+        self.assertIn("cursor=next", get.call_args_list[1].args[0])
 
 
 if __name__ == "__main__":
